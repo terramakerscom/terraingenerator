@@ -27,7 +27,7 @@ from google.colab import files
 EARTH_RADIUS_KM = 6371.0
 # CHANGE
 MODEL_WIDTH_MM = 333.0
-TOP_HEIGHT_MM = 30.0
+TOP_HEIGHT_MM = 50.0
 # CHANGE
 ZSCALE = 20.0
 
@@ -88,8 +88,38 @@ reproject(
     dst_crs=dst_crs,
     resampling=Resampling.bilinear
 )
+
 print(
-    "Reprojected:",
+    "Before upscale:",
+    reprojected.shape
+)
+
+# ============================================================
+# UPSCALE TERRAIN GRID - SMOOTHER CYLINDER CUT
+# ============================================================
+
+from scipy.ndimage import zoom
+from affine import Affine
+
+UPSCALE = 4
+
+reprojected = zoom(
+    reprojected,
+    UPSCALE,
+    order=1
+)
+
+transform = Affine(
+    transform.a / UPSCALE,
+    transform.b,
+    transform.c,
+    transform.d,
+    transform.e / UPSCALE,
+    transform.f
+)
+
+print(
+    "After upscale:",
     reprojected.shape
 )
 
@@ -365,7 +395,7 @@ BASE_DIAMETER_MM = 200.0
 BASE_RADIUS_MM = (
     BASE_DIAMETER_MM / 2.0
 )
-SEGMENTS = 256
+SEGMENTS = 512
 
 # ============================================================
 # COPY TERRAIN
@@ -618,6 +648,17 @@ print(
     "Volume:",
     final_mesh.volume
 )
+
+# ============================================================
+# GEOGRAPHIC CENTER OF MODEL
+# ============================================================
+
+center_lon = np.mean(lon_valid)
+center_lat = np.mean(lat_valid)
+print()
+print("=== GEOGRAPHIC CENTER ===")
+print("Latitude :", center_lat)
+print("Longitude:", center_lon)
 
 # ============================================================
 # EXPORT
