@@ -1,0 +1,642 @@
+# Script:      True Spherical Terrain Generator from TouchTerrain TIFF Data
+# Version:     3.12
+# Author:      Script by Jan Mestan, TerraMakers
+# Description: Converts a TouchTerrain TIFF digital elevation model into a 3D
+#              printable spherical terrain mesh. It handles reprojection,
+#              true sphere scale calculation, triangulation, and prepares
+#              the terrain for a closed cylindrical base.
+# Part 1/2:    TIFF Reprojection, Spherical Transformation & Mesh Generation
+# Part 2/2:    Cylindrical Base Integration & Mesh Closure
+
+# ============================================================
+# Terrain TIFF -> TRUE SPHERICAL TERRAIN
+# PART 1/2
+# ============================================================
+
+!pip install rasterio pyproj numpy scipy trimesh pillow --quiet
+import numpy as np
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+import trimesh
+from google.colab import files
+
+# ============================================================
+# USER PARAMETERS
+# ============================================================
+
+EARTH_RADIUS_KM = 6371.0
+# CHANGE
+MODEL_WIDTH_MM = 333.0
+TOP_HEIGHT_MM = 30.0
+# CHANGE
+ZSCALE = 20.0
+
+# ============================================================
+# UPLOAD TIFF
+# ============================================================
+print("Upload TouchTerrain TIFF")
+uploaded = files.upload()
+tif_file = list(uploaded.keys())[0]
+print("Loaded:", tif_file)
+
+# ============================================================
+# READ TIFF
+# ============================================================
+
+src = rasterio.open(tif_file)
+print("\nOriginal CRS:")
+print(src.crs)
+elevation = src.read(1).astype(np.float64)
+if src.nodata is not None:
+    elevation[
+        np.isclose(
+            elevation,
+            src.nodata
+        )
+    ] = np.nan
+elevation[
+    ~np.isfinite(elevation)
+] = np.nan
+print(
+    "Elevation range:",
+    np.nanmin(elevation),
+    np.nanmax(elevation)
+)
+
+# ============================================================
+# REPROJECT TO EPSG4326
+# ============================================================
+
+dst_crs="EPSG:4326"
+transform, width, height = calculate_default_transform(
+    src.crs,
+    dst_crs,
+    src.width,
+    src.height,
+    *src.bounds
+)
+reprojected=np.empty(
+    (height,width),
+    dtype=np.float64
+)
+reproject(
+    source=elevation,
+    destination=reprojected,
+    src_transform=src.transform,
+    src_crs=src.crs,
+    dst_transform=transform,
+    dst_crs=dst_crs,
+    resampling=Resampling.bilinear
+)
+print(
+    "Reprojected:",
+    reprojected.shape
+)
+
+# ============================================================
+# CREATE LAT/LON GRID
+# ============================================================
+
+rows, cols = np.indices(
+    reprojected.shape
+)
+xs, ys = rasterio.transform.xy(
+    transform,
+    rows,
+    cols
+)
+lon=np.array(xs)
+lat=np.array(ys)
+lon=lon.reshape(
+    reprojected.shape
+)
+lat=lat.reshape(
+    reprojected.shape
+)
+mask=np.isfinite(
+    reprojected
+)
+lon_valid = lon[mask]
+lat_valid = lat[mask]
+elev_valid = reprojected[mask]
+
+# ============================================================
+# SCALE CALCULATION
+# ============================================================
+
+lon_extent = (
+    lon_valid.max()
+    -
+    lon_valid.min()
+)
+earth_circum_mm = (
+    2*np.pi*
+    EARTH_RADIUS_KM*
+    1000000
+)
+from pyproj import Geod
+geod = Geod(ellps="WGS84")
+lon_min = lon_valid.min()
+lon_max = lon_valid.max()
+lat_center = np.mean(lat_valid)
+_, _, distance_m = geod.inv(
+    lon_min, lat_center,
+    lon_max, lat_center
+)
+physical_width_mm = distance_m * 1000
+scale = (
+    MODEL_WIDTH_MM /
+    physical_width_mm
+)
+MAP_SCALE = 1 / scale
+print()
+print("Model scale 1:")
+print(1/scale)
+
+# ============================================================
+# CREATE SPHERICAL TERRAIN
+# ============================================================
+
+lon_r=np.deg2rad(
+    lon_valid
+)
+lat_r=np.deg2rad(
+    lat_valid
+)
+terrain_height_m = (
+    elev_valid *
+    ZSCALE
+)
+terrain_height_mm = (
+    terrain_height_m *
+    1000 /
+    MAP_SCALE
+)
+earth_radius_mm = (
+    EARTH_RADIUS_KM *
+    1000000 /
+    MAP_SCALE
+)
+radius = (
+    earth_radius_mm +
+    terrain_height_mm
+)
+X = (
+    radius *
+    np.cos(lat_r) *
+    np.cos(lon_r)
+)
+Y = (
+    radius *
+    np.cos(lat_r) *
+    np.sin(lon_r)
+)
+Z = (
+    radius *
+    np.sin(lat_r)
+)
+vertices=np.column_stack(
+    [
+        X,
+        Y,
+        Z
+    ]
+)
+
+# ============================================================
+# COMPUTE MODEL SPHERE RADIUS + TRUE SCALE
+# ============================================================
+
+distances = np.linalg.norm(vertices, axis=1)
+model_radius_mm = np.mean(distances)
+true_scale = model_radius_mm / (EARTH_RADIUS_KM * 1_000_000)
+print()
+print("=== TRUE SPHERE SCALE ===")
+print("Model radius [mm]:", model_radius_mm)
+print("Scale factor:", true_scale)
+print("True map scale 1:", 1 / true_scale)
+
+# ============================================================
+# TRIANGULATION
+# ============================================================
+
+h,w = reprojected.shape
+index=-np.ones(
+    reprojected.shape,
+    dtype=int
+)
+index[mask]=np.arange(
+    np.sum(mask)
+)
+faces=[]
+for i in range(h-1):
+    for j in range(w-1):
+        a=index[i,j]
+        b=index[i,j+1]
+        c=index[i+1,j]
+        d=index[i+1,j+1]
+        if (
+            a>=0 and
+            b>=0 and
+            c>=0
+        ):
+            faces.append(
+                [
+                    a,
+                    b,
+                    c
+                ]
+            )
+        if (
+            b>=0 and
+            c>=0 and
+            d>=0
+        ):
+            faces.append(
+                [
+                    b,
+                    d,
+                    c
+                ]
+            )
+faces=np.array(
+    faces,
+    dtype=np.int64
+)
+terrain=trimesh.Trimesh(
+    vertices=vertices,
+    faces=faces,
+    process=False
+)
+
+# ============================================================
+# CLEAN MESH - NEW TRIMESH API
+# ============================================================
+
+terrain.update_faces(
+    terrain.unique_faces()
+)
+valid_faces = (
+    terrain.area_faces > 1e-12
+)
+terrain.update_faces(
+    valid_faces
+)
+terrain.remove_unreferenced_vertices()
+print()
+print("Terrain mesh:")
+print(terrain)
+
+# ============================================================
+# ROTATE TERRAIN CENTER TO Z AXIS
+# ============================================================
+
+center = terrain.centroid.copy()
+direction = (
+    center /
+    np.linalg.norm(center)
+)
+target=np.array(
+    [
+        0.0,
+        0.0,
+        1.0
+    ]
+)
+axis=np.cross(
+    direction,
+    target
+)
+dot=np.clip(
+    np.dot(direction,target),
+    -1.0,
+    1.0
+)
+angle=np.arccos(dot)
+if np.linalg.norm(axis)>1e-12:
+    axis/=np.linalg.norm(axis)
+    matrix = trimesh.transformations.rotation_matrix(
+        angle,
+        axis
+    )
+    terrain.apply_transform(
+        matrix
+    )
+# center origin
+terrain.apply_translation(
+    -terrain.centroid
+)
+
+# ============================================================
+# MOVE HIGHEST POINT TO TOP_HEIGHT_MM mm
+# ============================================================
+
+max_z = terrain.vertices[:,2].max()
+terrain.vertices[:,2] -= (
+    max_z -
+    TOP_HEIGHT_MM
+)
+print()
+print(
+    "Final terrain Z:",
+    terrain.vertices[:,2].min(),
+    terrain.vertices[:,2].max()
+)
+print()
+print("PART 1/2 COMPLETE")
+print("Variable ready:")
+print("terrain")
+
+# ============================================================
+# Terrain TIFF -> CLOSED CYLINDRICAL BASE
+# PART 2/2
+# ============================================================
+
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
+from google.colab import files
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+BASE_DIAMETER_MM = 200.0
+BASE_RADIUS_MM = (
+    BASE_DIAMETER_MM / 2.0
+)
+SEGMENTS = 256
+
+# ============================================================
+# COPY TERRAIN
+# ============================================================
+
+shell = terrain.copy()
+print("Original terrain:")
+print(shell)
+
+# ============================================================
+# CREATE CYLINDER CUT
+# ============================================================
+
+r = np.sqrt(
+    shell.vertices[:,0]**2 +
+    shell.vertices[:,1]**2
+)
+inside = (
+    r <= BASE_RADIUS_MM
+)
+face_mask = np.all(
+    inside[shell.faces],
+    axis=1
+)
+faces_cut = shell.faces[face_mask]
+shell_cut = trimesh.Trimesh(
+    vertices=shell.vertices,
+    faces=faces_cut,
+    process=True
+)
+shell_cut.remove_unreferenced_vertices()
+print()
+print("After cylinder cut:")
+print(shell_cut)
+
+# ============================================================
+# FIND OPEN EDGE LOOP
+# ============================================================
+
+edges = shell_cut.edges_sorted
+unique_edges, counts = np.unique(
+    edges,
+    axis=0,
+    return_counts=True
+)
+boundary_edges = unique_edges[
+    counts == 1
+]
+if len(boundary_edges)==0:
+    raise Exception(
+        "No open boundary found. Cylinder cut failed."
+    )
+boundary_vertices=np.unique(
+    boundary_edges
+)
+boundary_points = (
+    shell_cut.vertices[
+        boundary_vertices
+    ]
+)
+print()
+print(
+    "Boundary vertices:",
+    len(boundary_vertices)
+)
+
+# ============================================================
+# SORT TERRAIN LOOP AROUND Z AXIS
+# ============================================================
+
+angles=np.arctan2(
+    boundary_points[:,1],
+    boundary_points[:,0]
+)
+order=np.argsort(
+    angles
+)
+terrain_loop_points = (
+    boundary_points[order]
+)
+
+# ============================================================
+# CREATE NEW BASE LOOP Ø200
+# ============================================================
+
+theta=np.linspace(
+    0,
+    2*np.pi,
+    SEGMENTS,
+    endpoint=False
+)
+base_loop=np.column_stack(
+    [
+        BASE_RADIUS_MM*np.cos(theta),
+        BASE_RADIUS_MM*np.sin(theta),
+        np.zeros(SEGMENTS)
+    ]
+)
+
+# ============================================================
+# RESAMPLE TERRAIN LOOP TO 256 POINTS
+# ============================================================
+
+tree=cKDTree(
+    terrain_loop_points[:,:2]
+)
+_, nearest = tree.query(
+    base_loop[:,:2],
+    k=1
+)
+terrain_loop = (
+    terrain_loop_points[
+        nearest
+    ]
+)
+
+# ============================================================
+# CREATE BASE DISK
+# ============================================================
+
+base_center=np.array(
+    [
+        [
+            0.0,
+            0.0,
+            0.0
+        ]
+    ]
+)
+base_vertices=np.vstack(
+    [
+        base_loop,
+        base_center
+    ]
+)
+center_index = SEGMENTS
+base_faces=[]
+for i in range(SEGMENTS):
+    n=(i+1)%SEGMENTS
+    base_faces.append(
+        [
+            center_index,
+            n,
+            i
+        ]
+    )
+base_faces=np.array(
+    base_faces
+)
+
+# ============================================================
+# MERGE TERRAIN + BASE
+# ============================================================
+
+vertices=np.vstack(
+    [
+        shell_cut.vertices,
+        base_vertices
+    ]
+)
+offset=len(
+    shell_cut.vertices
+)
+faces=list(
+    shell_cut.faces
+)
+faces.extend(
+    base_faces + offset
+)
+
+# ============================================================
+# BRIDGE EDGE LOOP
+# ============================================================
+
+for i in range(SEGMENTS):
+    a1 = terrain_loop[i]
+    a2 = terrain_loop[
+        (i+1)%SEGMENTS
+    ]
+    b1 = offset+i
+    b2 = offset+(
+        (i+1)%SEGMENTS
+    )
+    faces.append(
+        [
+            np.where(
+                np.all(
+                    vertices==a1,
+                    axis=1
+                )
+            )[0][0],
+            np.where(
+                np.all(
+                    vertices==a2,
+                    axis=1
+                )
+            )[0][0],
+            b2
+        ]
+    )
+    faces.append(
+        [
+            np.where(
+                np.all(
+                    vertices==a1,
+                    axis=1
+                )
+            )[0][0],
+            b2,
+            b1
+        ]
+    )
+faces=np.array(
+    faces,
+    dtype=np.int64
+)
+
+# ============================================================
+# FINAL MESH
+# ============================================================
+
+final_mesh=trimesh.Trimesh(
+    vertices=vertices,
+    faces=faces,
+    process=True
+)
+
+# ============================================================
+# CLEAN FINAL MODEL
+# ============================================================
+
+final_mesh.update_faces(
+    final_mesh.unique_faces()
+)
+final_mesh.update_faces(
+    final_mesh.area_faces > 1e-12
+)
+final_mesh.remove_unreferenced_vertices()
+final_mesh.fix_normals()
+print()
+print("==============================")
+print("FINAL CLOSED MODEL")
+print("==============================")
+print(final_mesh)
+print(
+    "Watertight:",
+    final_mesh.is_watertight
+)
+print(
+    "Volume:",
+    final_mesh.volume
+)
+
+# ============================================================
+# EXPORT
+# ============================================================
+
+output_file = (
+    "terrain_closed_cylinder_200mm.stl"
+)
+final_mesh.export(
+    output_file,
+    file_type="stl"
+)
+print()
+print("Saved:")
+print(output_file)
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+files.download(
+    output_file
+)
