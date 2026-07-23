@@ -34,6 +34,7 @@ ZSCALE = 20.0
 # ============================================================
 # UPLOAD TIFF
 # ============================================================
+
 print("Upload TouchTerrain TIFF")
 uploaded = files.upload()
 tif_file = list(uploaded.keys())[0]
@@ -88,7 +89,6 @@ reproject(
     dst_crs=dst_crs,
     resampling=Resampling.bilinear
 )
-
 print(
     "Before upscale:",
     reprojected.shape
@@ -100,15 +100,12 @@ print(
 
 from scipy.ndimage import zoom
 from affine import Affine
-
-UPSCALE = 4
-
+UPSCALE = 2
 reprojected = zoom(
     reprojected,
     UPSCALE,
-    order=1
+    order=3
 )
-
 transform = Affine(
     transform.a / UPSCALE,
     transform.b,
@@ -117,7 +114,6 @@ transform = Affine(
     transform.e / UPSCALE,
     transform.f
 )
-
 print(
     "After upscale:",
     reprojected.shape
@@ -378,306 +374,276 @@ print("Variable ready:")
 print("terrain")
 
 # ============================================================
-# Terrain TIFF -> CLOSED CYLINDRICAL BASE
-# PART 2/2
+# TRUE CYLINDER CUT + CLOSED BASE (WATERTIGHT VERSION)
 # ============================================================
 
-import numpy as np
+import trimesh.repair as repair
 import trimesh
-from scipy.spatial import cKDTree
+import numpy as np
+from scipy.interpolate import griddata
+from scipy.spatial import Delaunay
 from google.colab import files
-
-# ============================================================
-# PARAMETERS
-# ============================================================
-
-BASE_DIAMETER_MM = 200.0
-BASE_RADIUS_MM = (
-    BASE_DIAMETER_MM / 2.0
-)
-SEGMENTS = 512
-
-# ============================================================
-# COPY TERRAIN
-# ============================================================
-
+import trimesh.repair as repair
+from scipy.spatial import cKDTree
 shell = terrain.copy()
-print("Original terrain:")
-print(shell)
 
-# ============================================================
-# CREATE CYLINDER CUT
-# ============================================================
+# ------------------------------------------------------------
+# PARAMETERS
+# ------------------------------------------------------------
 
-r = np.sqrt(
-    shell.vertices[:,0]**2 +
-    shell.vertices[:,1]**2
-)
-inside = (
-    r <= BASE_RADIUS_MM
-)
-face_mask = np.all(
-    inside[shell.faces],
-    axis=1
-)
-faces_cut = shell.faces[face_mask]
-shell_cut = trimesh.Trimesh(
-    vertices=shell.vertices,
-    faces=faces_cut,
-    process=True
-)
-shell_cut.remove_unreferenced_vertices()
-print()
-print("After cylinder cut:")
-print(shell_cut)
+BASE_DIAMETER_MM = 150
+BASE_RADIUS_MM = BASE_DIAMETER_MM / 2
+SEGMENTS = 256
 
-# ============================================================
-# FIND OPEN EDGE LOOP
-# ============================================================
+# ------------------------------------------------------------
+# CREATE CYLINDER BORDER
+# ------------------------------------------------------------
 
-edges = shell_cut.edges_sorted
-unique_edges, counts = np.unique(
-    edges,
-    axis=0,
-    return_counts=True
-)
-boundary_edges = unique_edges[
-    counts == 1
-]
-if len(boundary_edges)==0:
-    raise Exception(
-        "No open boundary found. Cylinder cut failed."
-    )
-boundary_vertices=np.unique(
-    boundary_edges
-)
-boundary_points = (
-    shell_cut.vertices[
-        boundary_vertices
-    ]
-)
-print()
-print(
-    "Boundary vertices:",
-    len(boundary_vertices)
-)
-
-# ============================================================
-# SORT TERRAIN LOOP AROUND Z AXIS
-# ============================================================
-
-angles=np.arctan2(
-    boundary_points[:,1],
-    boundary_points[:,0]
-)
-order=np.argsort(
-    angles
-)
-terrain_loop_points = (
-    boundary_points[order]
-)
-
-# ============================================================
-# CREATE NEW BASE LOOP Ø200
-# ============================================================
-
-theta=np.linspace(
+theta = np.linspace(
     0,
     2*np.pi,
     SEGMENTS,
     endpoint=False
 )
-base_loop=np.column_stack(
+circle_xy = np.column_stack(
+    [
+        BASE_RADIUS_MM*np.cos(theta),
+        BASE_RADIUS_MM*np.sin(theta)
+    ]
+)
+
+# ------------------------------------------------------------
+# INTERPOLATE HEIGHT ON BORDER
+# ------------------------------------------------------------
+
+xy = shell.vertices[:, :2]
+z = shell.vertices[:, 2]
+circle_z = griddata(
+    xy,
+    z,
+    circle_xy,
+    method="linear"
+)
+missing = np.isnan(circle_z)
+if np.any(missing):
+    circle_z[missing] = griddata(
+        xy,
+        z,
+        circle_xy[missing],
+        method="nearest"
+    )
+top_loop = np.column_stack(
+    [
+        circle_xy,
+        circle_z
+    ]
+)
+
+# ------------------------------------------------------------
+# CREATE TERRAIN INSIDE CYLINDER
+# ------------------------------------------------------------
+
+r = np.linalg.norm(
+    shell.vertices[:,:2],
+    axis=1
+)
+inside = r <= BASE_RADIUS_MM
+terrain_points = shell.vertices[inside]
+# remove points that would duplicate border (lepší verze)
+from scipy.spatial import cKDTree
+points_xy = terrain_points[:,:2]
+tree = cKDTree(circle_xy)
+dist, _ = tree.query(points_xy, k=1)
+keep = dist > 1e-6
+terrain_points = terrain_points[keep]
+
+# ------------------------------------------------------------
+# BUILD TOP CAP
+# ------------------------------------------------------------
+
+cap_vertices = np.vstack(
+    [
+        terrain_points,
+        top_loop
+    ]
+)
+top_boundary_offset = len(terrain_points)
+tri = Delaunay(
+    cap_vertices[:,:2]
+)
+top_faces = tri.simplices
+centers = np.mean(
+    cap_vertices[top_faces][:,:,:2],
+    axis=1
+)
+valid = (
+    np.linalg.norm(
+        centers,
+        axis=1
+    )
+    <= BASE_RADIUS_MM
+)
+top_faces = top_faces[valid]
+
+# ------------------------------------------------------------
+# BOTTOM DISK
+# ------------------------------------------------------------
+
+bottom_loop = np.column_stack(
     [
         BASE_RADIUS_MM*np.cos(theta),
         BASE_RADIUS_MM*np.sin(theta),
         np.zeros(SEGMENTS)
     ]
 )
-
-# ============================================================
-# RESAMPLE TERRAIN LOOP TO 256 POINTS
-# ============================================================
-
-tree=cKDTree(
-    terrain_loop_points[:,:2]
-)
-_, nearest = tree.query(
-    base_loop[:,:2],
-    k=1
-)
-terrain_loop = (
-    terrain_loop_points[
-        nearest
-    ]
-)
-
-# ============================================================
-# CREATE BASE DISK
-# ============================================================
-
-base_center=np.array(
+bottom_center = np.array(
     [
-        [
-            0.0,
-            0.0,
-            0.0
-        ]
+        [0,0,0]
     ]
 )
-base_vertices=np.vstack(
+bottom_vertices = np.vstack(
     [
-        base_loop,
-        base_center
+        bottom_loop,
+        bottom_center
     ]
 )
-center_index = SEGMENTS
-base_faces=[]
+
+bottom_offset = len(cap_vertices)
+bottom_faces=[]
+center_id = bottom_offset + SEGMENTS
 for i in range(SEGMENTS):
     n=(i+1)%SEGMENTS
-    base_faces.append(
+    bottom_faces.append(
         [
-            center_index,
-            n,
-            i
+            center_id,
+            bottom_offset+n,
+            bottom_offset+i
         ]
     )
-base_faces=np.array(
-    base_faces
-)
 
-# ============================================================
-# MERGE TERRAIN + BASE
-# ============================================================
+# ------------------------------------------------------------
+# MERGE ALL VERTICES
+# ------------------------------------------------------------
 
 vertices=np.vstack(
     [
-        shell_cut.vertices,
-        base_vertices
+        cap_vertices,
+        bottom_vertices
     ]
-)
-offset=len(
-    shell_cut.vertices
 )
 faces=list(
-    shell_cut.faces
-)
-faces.extend(
-    base_faces + offset
+    top_faces
 )
 
-# ============================================================
-# BRIDGE EDGE LOOP
-# ============================================================
+# ------------------------------------------------------------
+# SIDE WALL
+# ------------------------------------------------------------
 
 for i in range(SEGMENTS):
-    a1 = terrain_loop[i]
-    a2 = terrain_loop[
-        (i+1)%SEGMENTS
-    ]
-    b1 = offset+i
-    b2 = offset+(
-        (i+1)%SEGMENTS
-    )
+    n=(i+1)%SEGMENTS
+    top_a = top_boundary_offset+i
+    top_b = top_boundary_offset+n
+    bottom_a = bottom_offset+i
+    bottom_b = bottom_offset+n
     faces.append(
         [
-            np.where(
-                np.all(
-                    vertices==a1,
-                    axis=1
-                )
-            )[0][0],
-            np.where(
-                np.all(
-                    vertices==a2,
-                    axis=1
-                )
-            )[0][0],
-            b2
+            top_a,
+            top_b,
+            bottom_b
         ]
     )
     faces.append(
         [
-            np.where(
-                np.all(
-                    vertices==a1,
-                    axis=1
-                )
-            )[0][0],
-            b2,
-            b1
+            top_a,
+            bottom_b,
+            bottom_a
         ]
     )
+faces.extend(
+    np.array(bottom_faces)
+)
+
+# ------------------------------------------------------------
+# CREATE FINAL MESH
+# ------------------------------------------------------------
+
 faces=np.array(
     faces,
     dtype=np.int64
 )
-
-# ============================================================
-# FINAL MESH
-# ============================================================
-
-final_mesh=trimesh.Trimesh(
+final_mesh = trimesh.Trimesh(
     vertices=vertices,
     faces=faces,
-    process=True
+    process=False
 )
 
-# ============================================================
-# CLEAN FINAL MODEL
-# ============================================================
+# ------------------------------------------------------------
+# CLEAN + ADVANCED REPAIR
+# ------------------------------------------------------------
 
-final_mesh.update_faces(
-    final_mesh.unique_faces()
-)
-final_mesh.update_faces(
-    final_mesh.area_faces > 1e-12
-)
+print("Cleaning mesh...")
+final_mesh.update_faces(final_mesh.unique_faces())
 final_mesh.remove_unreferenced_vertices()
+final_mesh.merge_vertices()
+final_mesh.merge_vertices(digits_vertex=6)
+import trimesh.repair as repair
+repair.fill_holes(final_mesh)
 final_mesh.fix_normals()
+final_mesh.update_faces(final_mesh.unique_faces())
+face_lengths = np.array([len(f) for f in final_mesh.faces])
+degenerate = face_lengths < 3
+if np.any(degenerate):
+    final_mesh.update_faces(~degenerate)
+print("\n=== AFTER REPAIR ===")
+print("Watertight:", final_mesh.is_watertight)
+print("Euler number:", final_mesh.euler_number)
+edges = final_mesh.edges_sorted
+unique_edges, counts = np.unique(edges, axis=0, return_counts=True)
+print("Boundary edges:", np.sum(counts == 1))
+print("Non-manifold edges:", np.sum(counts > 2))
+print(final_mesh)
+
+# ------------------------------------------------------------
+# VALIDATION
+# ------------------------------------------------------------
 print()
 print("==============================")
-print("FINAL CLOSED MODEL")
+print("MESH VALIDATION")
 print("==============================")
-print(final_mesh)
+print(
+    "Euler:",
+    final_mesh.euler_number
+)
 print(
     "Watertight:",
     final_mesh.is_watertight
 )
-print(
-    "Volume:",
-    final_mesh.volume
+edges = final_mesh.edges_sorted
+unique_edges, counts = np.unique(
+    edges,
+    axis=0,
+    return_counts=True
 )
+print(
+    "Boundary edges:",
+    np.sum(counts==1)
+)
+print(
+    "Non-manifold edges:",
+    np.sum(counts>2)
+)
+print(final_mesh)
 
-# ============================================================
-# GEOGRAPHIC CENTER OF MODEL
-# ============================================================
-
-center_lon = np.mean(lon_valid)
-center_lat = np.mean(lat_valid)
-print()
-print("=== GEOGRAPHIC CENTER ===")
-print("Latitude :", center_lat)
-print("Longitude:", center_lon)
-
-# ============================================================
+# ------------------------------------------------------------
 # EXPORT
-# ============================================================
+# ------------------------------------------------------------
 
 output_file = (
-    "terrain_closed_cylinder_200mm.stl"
+    "terrain_closed_cylinder_FIXED.stl"
 )
 final_mesh.export(
-    output_file,
-    file_type="stl"
+    output_file
 )
-print()
-print("Saved:")
-print(output_file)
-
-# ============================================================
-# DOWNLOAD
-# ============================================================
 files.download(
     output_file
 )
