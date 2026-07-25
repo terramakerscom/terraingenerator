@@ -29,7 +29,7 @@ EARTH_RADIUS_KM = 6371.0
 MODEL_WIDTH_MM = 333.0
 TOP_HEIGHT_MM = 50.0
 # CHANGE
-ZSCALE = 20.0
+ZSCALE = 1.3
 
 # ============================================================
 # UPLOAD TIFF
@@ -391,7 +391,7 @@ shell = terrain.copy()
 # PARAMETERS
 # ------------------------------------------------------------
 
-BASE_DIAMETER_MM = 150
+BASE_DIAMETER_MM = 180
 BASE_RADIUS_MM = BASE_DIAMETER_MM / 2
 SEGMENTS = 256
 
@@ -507,7 +507,6 @@ bottom_vertices = np.vstack(
         bottom_center
     ]
 )
-
 bottom_offset = len(cap_vertices)
 bottom_faces=[]
 center_id = bottom_offset + SEGMENTS
@@ -606,6 +605,7 @@ print(final_mesh)
 # ------------------------------------------------------------
 # VALIDATION
 # ------------------------------------------------------------
+
 print()
 print("==============================")
 print("MESH VALIDATION")
@@ -639,7 +639,7 @@ print(final_mesh)
 # ------------------------------------------------------------
 
 output_file = (
-    "terrain_closed_cylinder_FIXED.stl"
+    "terrain_closed_cylinder.stl"
 )
 final_mesh.export(
     output_file
@@ -647,3 +647,76 @@ final_mesh.export(
 files.download(
     output_file
 )
+
+# ============================================================
+# GENERATE KML CIRCLE
+# ============================================================
+
+from pyproj import Geod
+import numpy as np
+print("\nGenerating KML circle...")
+
+# --------------------------------------------------
+# CENTER (same data as terrain)
+# --------------------------------------------------
+
+lat0 = np.mean(lat_valid)
+lon0 = np.mean(lon_valid)
+
+# --------------------------------------------------
+# RADIUS (from cylinder, exact match!)
+# --------------------------------------------------
+
+BASE_RADIUS_MM = 180 / 2  # same as above
+radius_m = BASE_RADIUS_MM / scale / 1000.0
+print(f"Center: {lat0:.6f}, {lon0:.6f}")
+print(f"Radius: {radius_m:.2f} m")
+
+# --------------------------------------------------
+# GEODETIC CIRCLE
+# --------------------------------------------------
+
+geod = Geod(ellps="WGS84")
+angles = np.linspace(0, 360, 360)
+lons = []
+lats = []
+for az in angles:
+    lon, lat, _ = geod.fwd(lon0, lat0, az, radius_m)
+    lons.append(lon)
+    lats.append(lat)
+# close polygon
+lons.append(lons[0])
+lats.append(lats[0])
+
+# --------------------------------------------------
+# KML FORMAT
+# --------------------------------------------------
+
+coords = ""
+for lon, lat in zip(lons, lats):
+    coords += f"{lon:.6f},{lat:.6f},0 "
+kml = f"""<kml xmlns="http://opengis.net">
+<Placemark>
+<Polygon>
+<outerBoundaryIs>
+<LinearRing>
+<coordinates>
+{coords}
+</coordinates>
+</LinearRing>
+</outerBoundaryIs>
+</Polygon>
+</Placemark>
+</kml>
+"""
+
+# --------------------------------------------------
+# SAVE + DOWNLOAD
+# --------------------------------------------------
+
+kml_file = "terrain_circle.kml"
+with open(kml_file, "w") as f:
+    f.write(kml)
+print("KML circle saved!")
+from google.colab import files
+files.download(kml_file)
