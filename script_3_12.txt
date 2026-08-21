@@ -1,7 +1,7 @@
 # ============================================================
 # TouchTerrain -> INNER MODEL + OUTER ANNULUS
 # Combined script by Jan Mestan
-# Based on inner v3.13 and annulus v3.12 scripts
+# Based on inner v3.10 and annulus v3.11 scripts
 # ============================================================
 
 !pip install rasterio pyproj numpy scipy trimesh pillow affine --quiet
