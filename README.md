@@ -1,1 +1,0 @@
-Converts a TouchTerrain TIFF digital elevation model into a 3D printable spherical terrain mesh. It handles reprojection, true sphere scale calculation, triangulation, and prepares the terrain for a closed cylindrical base.
