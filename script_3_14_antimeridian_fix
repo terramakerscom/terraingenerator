@@ -1,0 +1,827 @@
+# ============================================================
+# TouchTerrain -> INNER MODEL + OUTER ANNULUS
+# Combined script by Jan Mestan
+# Based on inner v3.10 and annulus v3.11 scripts
+# ============================================================
+
+!pip install rasterio pyproj numpy scipy trimesh pillow affine --quiet
+
+import time
+import numpy as np
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from scipy.ndimage import zoom, gaussian_filter
+from affine import Affine
+from pyproj import Geod
+from scipy.interpolate import LinearNDInterpolator
+from scipy.spatial import Delaunay, cKDTree
+import trimesh
+import trimesh.repair as repair
+from google.colab import files
+
+# ============================================================
+# USER PARAMETERS
+# ============================================================
+
+EARTH_RADIUS_KM = 6371.0
+MODEL_WIDTH_MM = 333.0
+ZSCALE = 1
+UPSCALE = 2
+
+# INNER MODEL
+INNER_TOP_HEIGHT_MM = 50.0
+INNER_BASE_DIAMETER_MM = 180.0
+INNER_BEVEL_MM = 2.4
+INNER_BEVEL_SEGMENTS = 20
+INNER_TOP_BEVEL_MM = 2.4
+INNER_TOP_BEVEL_SEGMENTS = 20
+
+# OUTER ANNULUS
+ANNULUS_TOP_HEIGHT_MM = 53.0
+ANNULUS_OUTER_DIAMETER_MM = 190.4
+ANNULUS_INNER_DIAMETER_MM = 180.4
+ANNULUS_BEVEL_MM = 2.4
+ANNULUS_BEVEL_SEGMENTS = 20
+ANNULUS_TOP_BEVEL_MM = 2.499
+ANNULUS_TOP_BEVEL_SEGMENTS = 20
+ANNULUS_SMOOTH_SIGMA = 2.0  # Gaussian smoothing ONLY for outer annulus; 0 = off
+
+# Angular resolution used by both output meshes
+SEGMENTS = 4096
+
+# ============================================================
+# UPLOAD TIFF ONCE
+# ============================================================
+
+_t_total = time.perf_counter()
+print("Upload ONE TouchTerrain TIFF")
+uploaded = files.upload()
+if not uploaded:
+    raise RuntimeError("No TIFF uploaded.")
+
+tif_file = list(uploaded.keys())[0]
+print("Loaded:", tif_file)
+
+# ============================================================
+# COMMON TIFF PREPROCESSING - RUNS ONLY ONCE
+# ============================================================
+
+with rasterio.open(tif_file) as src:
+    print("\nOriginal CRS:")
+    print(src.crs)
+
+    elevation = src.read(1).astype(np.float64)
+    if src.nodata is not None:
+        elevation[np.isclose(elevation, src.nodata)] = np.nan
+    elevation[~np.isfinite(elevation)] = np.nan
+
+    print("Elevation range:", np.nanmin(elevation), np.nanmax(elevation))
+
+    dst_crs = "EPSG:4326"
+    transform, width, height = calculate_default_transform(
+        src.crs, dst_crs, src.width, src.height, *src.bounds
+    )
+
+    reprojected = np.empty((height, width), dtype=np.float64)
+    reproject(
+        source=elevation,
+        destination=reprojected,
+        src_transform=src.transform,
+        src_crs=src.crs,
+        dst_transform=transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.bilinear,
+    )
+
+print("Before upscale:", reprojected.shape)
+
+reprojected = zoom(reprojected, UPSCALE, order=3)
+transform = Affine(
+    transform.a / UPSCALE,
+    transform.b,
+    transform.c,
+    transform.d,
+    transform.e / UPSCALE,
+    transform.f,
+)
+
+print("After upscale:", reprojected.shape)
+
+# OUTER ANNULUS ONLY: make a smoothed copy of the elevation raster.
+# The original "reprojected" array remains untouched and is used by INNER.
+def gaussian_filter_nan(data, sigma):
+    if sigma <= 0:
+        return data.copy()
+
+    valid = np.isfinite(data)
+    values = np.where(valid, data, 0.0)
+
+    smooth_values = gaussian_filter(values, sigma=sigma, mode="nearest")
+    smooth_weights = gaussian_filter(valid.astype(np.float64), sigma=sigma, mode="nearest")
+
+    out = np.full_like(data, np.nan, dtype=np.float64)
+    np.divide(
+        smooth_values,
+        smooth_weights,
+        out=out,
+        where=smooth_weights > 1e-12,
+    )
+
+    # Preserve the original NoData footprint.
+    out[~valid] = np.nan
+    return out
+
+
+reprojected_annulus = gaussian_filter_nan(reprojected, ANNULUS_SMOOTH_SIGMA)
+print("Annulus-only Gaussian sigma:", ANNULUS_SMOOTH_SIGMA)
+
+# Lat/lon grid
+rows, cols = np.indices(reprojected.shape)
+xs, ys = rasterio.transform.xy(transform, rows, cols)
+lon = np.array(xs).reshape(reprojected.shape)
+lat = np.array(ys).reshape(reprojected.shape)
+
+mask = np.isfinite(reprojected)
+lon_valid = lon[mask]
+lat_valid = lat[mask]
+elev_valid = reprojected[mask]
+elev_annulus_valid = reprojected_annulus[mask]
+
+# Model scale
+# Robust calculation based on the ORIGINAL source raster extent.
+# For projected CRS with linear units in metres (e.g. UTM), use the raster
+# width directly in source coordinates. This avoids antimeridian problems
+# caused by reprojection to EPSG:4326.
+#
+# For geographic CRS, fall back to a geodesic width calculation using the
+# raster bounds and the latitude at the vertical center of the raster.
+
+with rasterio.open(tif_file) as src_scale:
+    src_bounds = src_scale.bounds
+    src_crs_scale = src_scale.crs
+
+    if src_crs_scale is None:
+        raise ValueError("TIFF has no CRS; cannot determine model scale reliably.")
+
+    if src_crs_scale.is_projected:
+        # Determine conversion from CRS linear units to metres.
+        # For EPSG:32753 this factor is exactly 1.0 (metres).
+        linear_factor_to_m = 1.0
+
+        try:
+            if src_crs_scale.linear_units_factor:
+                # rasterio/pyproj commonly returns e.g. ('metre', 1.0)
+                linear_factor_to_m = float(src_crs_scale.linear_units_factor[1])
+        except Exception:
+            pass
+
+        physical_width_m = abs(src_bounds.right - src_bounds.left) * linear_factor_to_m
+
+    elif src_crs_scale.is_geographic:
+        geod = Geod(ellps="WGS84")
+
+        lon_left = src_bounds.left
+        lon_right = src_bounds.right
+        lat_center = 0.5 * (src_bounds.bottom + src_bounds.top)
+
+        # Normalize longitude span so antimeridian-crossing rasters use the
+        # intended continuous span rather than an accidental near-360° extent.
+        lon_span = lon_right - lon_left
+        if lon_span > 180.0:
+            lon_right -= 360.0
+        elif lon_span < -180.0:
+            lon_right += 360.0
+
+        _, _, physical_width_m = geod.inv(
+            lon_left, lat_center,
+            lon_right, lat_center
+        )
+        physical_width_m = abs(physical_width_m)
+
+    else:
+        raise ValueError(
+            f"Unsupported CRS type for automatic scale calculation: {src_crs_scale}"
+        )
+
+if not np.isfinite(physical_width_m) or physical_width_m <= 0:
+    raise ValueError(f"Invalid physical raster width: {physical_width_m}")
+
+physical_width_mm = physical_width_m * 1000.0
+MAP_SCALE = physical_width_mm / MODEL_WIDTH_MM
+scale = 1.0 / MAP_SCALE
+
+print("\n=== MODEL SCALE ===")
+print("Source CRS:", src_crs_scale)
+print(f"Physical raster width: {physical_width_m / 1000.0:,.3f} km")
+print(f"Model width: {MODEL_WIDTH_MM:.3f} mm")
+print(f"Model scale 1 : {MAP_SCALE:,.2f}")
+
+# Spherical terrain
+lon_r = np.deg2rad(lon_valid)
+lat_r = np.deg2rad(lat_valid)
+terrain_height_m = elev_valid * ZSCALE
+terrain_height_mm = terrain_height_m * 1000.0 / MAP_SCALE
+earth_radius_mm = EARTH_RADIUS_KM * 1_000_000.0 / MAP_SCALE
+radius = earth_radius_mm + terrain_height_mm
+
+X = radius * np.cos(lat_r) * np.cos(lon_r)
+Y = radius * np.cos(lat_r) * np.sin(lon_r)
+Z = radius * np.sin(lat_r)
+vertices = np.column_stack([X, Y, Z])
+
+# Separate spherical terrain for OUTER ANNULUS only, using the smoothed elevations.
+annulus_terrain_height_m = elev_annulus_valid * ZSCALE
+annulus_terrain_height_mm = annulus_terrain_height_m * 1000.0 / MAP_SCALE
+annulus_radius = earth_radius_mm + annulus_terrain_height_mm
+
+X_annulus = annulus_radius * np.cos(lat_r) * np.cos(lon_r)
+Y_annulus = annulus_radius * np.cos(lat_r) * np.sin(lon_r)
+Z_annulus = annulus_radius * np.sin(lat_r)
+vertices_annulus = np.column_stack([X_annulus, Y_annulus, Z_annulus])
+
+# True sphere scale info
+distances = np.linalg.norm(vertices, axis=1)
+model_radius_mm = np.mean(distances)
+true_scale = model_radius_mm / (EARTH_RADIUS_KM * 1_000_000.0)
+print("\n=== TRUE SPHERE SCALE ===")
+print("Model radius [mm]:", model_radius_mm)
+print("Scale factor:", true_scale)
+print("True map scale 1:", 1.0 / true_scale)
+
+# Triangulation - vectorized (same triangles as the original nested loops)
+h, w = reprojected.shape
+index = -np.ones(reprojected.shape, dtype=np.int64)
+index[mask] = np.arange(np.sum(mask), dtype=np.int64)
+
+a = index[:-1, :-1].ravel()
+b = index[:-1, 1:].ravel()
+c = index[1:, :-1].ravel()
+d = index[1:, 1:].ravel()
+
+valid_abc = (a >= 0) & (b >= 0) & (c >= 0)
+valid_bdc = (b >= 0) & (d >= 0) & (c >= 0)
+
+faces_abc = np.column_stack((a[valid_abc], b[valid_abc], c[valid_abc]))
+faces_bdc = np.column_stack((b[valid_bdc], d[valid_bdc], c[valid_bdc]))
+faces = np.vstack((faces_abc, faces_bdc)).astype(np.int64, copy=False)
+
+terrain_base = trimesh.Trimesh(
+    vertices=vertices,
+    faces=faces,
+    process=False,
+)
+terrain_base_annulus = trimesh.Trimesh(
+    vertices=vertices_annulus,
+    faces=faces.copy(),
+    process=False,
+)
+
+# Clean both meshes independently while keeping their geometry aligned.
+for _mesh in (terrain_base, terrain_base_annulus):
+    _mesh.update_faces(_mesh.unique_faces())
+    valid_faces = _mesh.area_faces > 1e-12
+    _mesh.update_faces(valid_faces)
+    _mesh.remove_unreferenced_vertices()
+
+# Rotate from the ORIGINAL terrain only, then apply the exact same transform
+# to the annulus-smoothed terrain. This keeps INNER and OUTER perfectly aligned.
+center = terrain_base.centroid.copy()
+direction = center / np.linalg.norm(center)
+target = np.array([0.0, 0.0, 1.0])
+axis = np.cross(direction, target)
+dot = np.clip(np.dot(direction, target), -1.0, 1.0)
+angle = np.arccos(dot)
+
+if np.linalg.norm(axis) > 1e-12:
+    axis /= np.linalg.norm(axis)
+    matrix = trimesh.transformations.rotation_matrix(angle, axis)
+    terrain_base.apply_transform(matrix)
+    terrain_base_annulus.apply_transform(matrix)
+
+common_translation = -terrain_base.centroid.copy()
+terrain_base.apply_translation(common_translation)
+terrain_base_annulus.apply_translation(common_translation)
+
+print("\nCommon terrain prepared:")
+print("Inner/original:", terrain_base)
+print("Outer/smoothed:", terrain_base_annulus)
+
+# ============================================================
+# FAST TERRAIN INTERPOLATOR - BUILT ONCE, REUSED EVERYWHERE
+# ============================================================
+# scipy.griddata(method="linear") internally rebuilds a Delaunay triangulation
+# on every call. The original scripts call it repeatedly for every bevel ring.
+# Build the triangulation once here and reuse it for BOTH meshes.
+_base_xy = terrain_base.vertices[:, :2]
+_base_z = terrain_base.vertices[:, 2]
+print("Building reusable terrain interpolator...")
+_terrain_linear = LinearNDInterpolator(_base_xy, _base_z, fill_value=np.nan)
+_terrain_nearest_tree = cKDTree(_base_xy)
+_BASE_MAX_Z = _base_z.max()
+
+_annulus_base_xy = terrain_base_annulus.vertices[:, :2]
+_annulus_base_z = terrain_base_annulus.vertices[:, 2]
+print("Building annulus-smoothed terrain interpolator...")
+_annulus_terrain_linear = LinearNDInterpolator(
+    _annulus_base_xy,
+    _annulus_base_z,
+    fill_value=np.nan,
+)
+_annulus_terrain_nearest_tree = cKDTree(_annulus_base_xy)
+_ANNULUS_BASE_MAX_Z = _annulus_base_z.max()
+
+print("Reusable terrain interpolators ready.")
+
+
+def interpolate_terrain_height(points_xy, z_shift=0.0):
+    values = np.asarray(_terrain_linear(points_xy), dtype=np.float64).reshape(-1)
+    missing = ~np.isfinite(values)
+    if np.any(missing):
+        _, nearest_idx = _terrain_nearest_tree.query(points_xy[missing], k=1)
+        values[missing] = _base_z[nearest_idx]
+    if z_shift != 0.0:
+        values = values + z_shift
+    return values
+
+
+def interpolate_annulus_terrain_height(points_xy, z_shift=0.0):
+    values = np.asarray(
+        _annulus_terrain_linear(points_xy),
+        dtype=np.float64,
+    ).reshape(-1)
+    missing = ~np.isfinite(values)
+    if np.any(missing):
+        _, nearest_idx = _annulus_terrain_nearest_tree.query(points_xy[missing], k=1)
+        values[missing] = _annulus_base_z[nearest_idx]
+    if z_shift != 0.0:
+        values = values + z_shift
+    return values
+
+
+def terrain_at_top_height(base_mesh, top_height_mm):
+    terrain = base_mesh.copy()
+    max_z = terrain.vertices[:, 2].max()
+    terrain.vertices[:, 2] -= (max_z - top_height_mm)
+    return terrain
+
+
+def validate_mesh(mesh, title):
+    print("\n==============================")
+    print(title)
+    print("==============================")
+    print("Euler:", mesh.euler_number)
+    print("Watertight:", mesh.is_watertight)
+    edges = mesh.edges_sorted
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    print("Boundary edges:", np.sum(counts == 1))
+    print("Non-manifold edges:", np.sum(counts > 2))
+    print(mesh)
+
+
+# ============================================================
+# OUTPUT 1: INNER CLOSED CYLINDER
+# ============================================================
+
+def build_inner_model(shell):
+    BASE_RADIUS_MM = INNER_BASE_DIAMETER_MM / 2.0
+    BEVEL_MM = INNER_BEVEL_MM
+    BEVEL_SEGMENTS = INNER_BEVEL_SEGMENTS
+    TOP_BEVEL_MM = INNER_TOP_BEVEL_MM
+    TOP_BEVEL_SEGMENTS = INNER_TOP_BEVEL_SEGMENTS
+
+    theta = np.linspace(0, 2 * np.pi, SEGMENTS, endpoint=False)
+    circle_xy = np.column_stack([
+        BASE_RADIUS_MM * np.cos(theta),
+        BASE_RADIUS_MM * np.sin(theta),
+    ])
+
+    # XY geometry is unchanged by the output-specific vertical shift.
+    # Reuse the common interpolator and add only that constant Z shift.
+    z_shift = shell.vertices[:, 2].max() - _BASE_MAX_Z
+
+    if TOP_BEVEL_MM < 0 or TOP_BEVEL_MM >= BASE_RADIUS_MM:
+        raise ValueError("Invalid INNER_TOP_BEVEL_MM")
+    if TOP_BEVEL_SEGMENTS < 1:
+        raise ValueError("INNER_TOP_BEVEL_SEGMENTS must be >= 1")
+
+    top_inner_radius = BASE_RADIUS_MM - TOP_BEVEL_MM
+    top_inner_xy = np.column_stack([
+        top_inner_radius * np.cos(theta),
+        top_inner_radius * np.sin(theta),
+    ])
+
+    def interpolate_border_height(points_xy):
+        return interpolate_terrain_height(points_xy, z_shift=z_shift)
+
+    top_inner_z = interpolate_border_height(top_inner_xy)
+    top_loop = np.column_stack([top_inner_xy, top_inner_z])
+
+    r = np.linalg.norm(shell.vertices[:, :2], axis=1)
+    terrain_points = shell.vertices[r <= top_inner_radius]
+
+    points_xy = terrain_points[:, :2]
+    tree = cKDTree(top_inner_xy)
+    dist, _ = tree.query(points_xy, k=1)
+    terrain_points = terrain_points[dist > 1e-6]
+
+    cap_vertices = np.vstack([terrain_points, top_loop])
+    top_boundary_offset = len(terrain_points)
+
+    tri = Delaunay(cap_vertices[:, :2])
+    top_faces = tri.simplices
+    centers = np.mean(cap_vertices[top_faces][:, :, :2], axis=1)
+    top_faces = top_faces[np.linalg.norm(centers, axis=1) <= top_inner_radius]
+
+    top_bevel_rings = []
+    if TOP_BEVEL_MM > 0:
+        for k in range(1, TOP_BEVEL_SEGMENTS + 1):
+            phi = (np.pi / 2) * k / TOP_BEVEL_SEGMENTS
+            ring_r = (
+                BASE_RADIUS_MM - TOP_BEVEL_MM
+                + TOP_BEVEL_MM * np.sin(phi)
+            )
+            ring_xy = np.column_stack([
+                ring_r * np.cos(theta),
+                ring_r * np.sin(theta),
+            ])
+            terrain_ring_z = interpolate_border_height(ring_xy)
+            bevel_drop = TOP_BEVEL_MM * (1.0 - np.cos(phi))
+            ring_z = terrain_ring_z - bevel_drop
+            top_bevel_rings.append(np.column_stack([ring_xy, ring_z]))
+
+    if BEVEL_MM <= 0:
+        bevel_rings = []
+    else:
+        if BEVEL_MM >= BASE_RADIUS_MM:
+            raise ValueError("INNER_BEVEL_MM too large")
+        if BEVEL_SEGMENTS < 1:
+            raise ValueError("INNER_BEVEL_SEGMENTS must be >= 1")
+        bevel_rings = []
+        for k in range(BEVEL_SEGMENTS):
+            phi = (np.pi / 2) * k / BEVEL_SEGMENTS
+            ring_r = BASE_RADIUS_MM - BEVEL_MM + BEVEL_MM * np.cos(phi)
+            ring_z = BEVEL_MM - BEVEL_MM * np.sin(phi)
+            bevel_rings.append(np.column_stack([
+                ring_r * np.cos(theta),
+                ring_r * np.sin(theta),
+                np.full(SEGMENTS, ring_z),
+            ]))
+
+    bottom_radius = BASE_RADIUS_MM - max(BEVEL_MM, 0)
+    bottom_loop = np.column_stack([
+        bottom_radius * np.cos(theta),
+        bottom_radius * np.sin(theta),
+        np.zeros(SEGMENTS),
+    ])
+    bottom_center = np.array([[0.0, 0.0, 0.0]])
+
+    parts = [cap_vertices]
+    top_bevel_offsets = []
+    for ring in top_bevel_rings:
+        top_bevel_offsets.append(sum(len(x) for x in parts))
+        parts.append(ring)
+
+    bevel_offsets = []
+    for ring in bevel_rings:
+        bevel_offsets.append(sum(len(x) for x in parts))
+        parts.append(ring)
+
+    bottom_offset = sum(len(x) for x in parts)
+    parts.append(bottom_loop)
+    center_id = sum(len(x) for x in parts)
+    parts.append(bottom_center)
+
+    all_vertices = np.vstack(parts)
+    all_faces = list(top_faces)
+
+    if top_bevel_offsets:
+        previous_offset = top_boundary_offset
+        for current_offset in top_bevel_offsets:
+            for i in range(SEGMENTS):
+                n = (i + 1) % SEGMENTS
+                a0, a1 = previous_offset + i, previous_offset + n
+                b0, b1 = current_offset + i, current_offset + n
+                all_faces.append([a0, a1, b1])
+                all_faces.append([a0, b1, b0])
+            previous_offset = current_offset
+        side_top_offset = top_bevel_offsets[-1]
+    else:
+        side_top_offset = top_boundary_offset
+
+    side_bottom_offset = bevel_offsets[0] if bevel_offsets else bottom_offset
+
+    for i in range(SEGMENTS):
+        n = (i + 1) % SEGMENTS
+        top_a, top_b = side_top_offset + i, side_top_offset + n
+        low_a, low_b = side_bottom_offset + i, side_bottom_offset + n
+        all_faces.append([top_a, top_b, low_b])
+        all_faces.append([top_a, low_b, low_a])
+
+    for a_off, b_off in zip(bevel_offsets[:-1], bevel_offsets[1:]):
+        for i in range(SEGMENTS):
+            n = (i + 1) % SEGMENTS
+            a0, a1 = a_off + i, a_off + n
+            b0, b1 = b_off + i, b_off + n
+            all_faces.append([a0, a1, b1])
+            all_faces.append([a0, b1, b0])
+
+    if bevel_offsets:
+        last_off = bevel_offsets[-1]
+        for i in range(SEGMENTS):
+            n = (i + 1) % SEGMENTS
+            a0, a1 = last_off + i, last_off + n
+            b0, b1 = bottom_offset + i, bottom_offset + n
+            all_faces.append([a0, a1, b1])
+            all_faces.append([a0, b1, b0])
+
+    for i in range(SEGMENTS):
+        n = (i + 1) % SEGMENTS
+        all_faces.append([center_id, bottom_offset + n, bottom_offset + i])
+
+    mesh = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=np.asarray(all_faces, dtype=np.int64),
+        process=False,
+    )
+
+    print("Cleaning inner mesh...")
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+    mesh.merge_vertices()
+    mesh.merge_vertices(digits_vertex=6)
+    repair.fill_holes(mesh)
+    mesh.fix_normals()
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+# ============================================================
+# OUTPUT 2: OUTER ANNULUS
+# ============================================================
+
+def build_annulus_model(shell):
+    OUTER_RADIUS_MM = ANNULUS_OUTER_DIAMETER_MM / 2.0
+    INNER_RADIUS_MM = ANNULUS_INNER_DIAMETER_MM / 2.0
+    BEVEL_MM = ANNULUS_BEVEL_MM
+    BEVEL_SEGMENTS = ANNULUS_BEVEL_SEGMENTS
+    TOP_BEVEL_MM = ANNULUS_TOP_BEVEL_MM
+    TOP_BEVEL_SEGMENTS = ANNULUS_TOP_BEVEL_SEGMENTS
+
+    if INNER_RADIUS_MM <= 0:
+        raise ValueError("ANNULUS_INNER_DIAMETER_MM must be > 0")
+    if INNER_RADIUS_MM >= OUTER_RADIUS_MM:
+        raise ValueError("Annulus inner diameter must be smaller than outer diameter")
+    if BEVEL_MM < 0 or TOP_BEVEL_MM < 0:
+        raise ValueError("Annulus bevels must be >= 0")
+    if BEVEL_SEGMENTS < 1 or TOP_BEVEL_SEGMENTS < 1:
+        raise ValueError("Annulus bevel segment counts must be >= 1")
+    if INNER_RADIUS_MM + BEVEL_MM >= OUTER_RADIUS_MM - BEVEL_MM:
+        raise ValueError("ANNULUS_BEVEL_MM is too large for annulus width")
+    if INNER_RADIUS_MM + TOP_BEVEL_MM >= OUTER_RADIUS_MM - TOP_BEVEL_MM:
+        raise ValueError("ANNULUS_TOP_BEVEL_MM is too large for annulus width")
+
+    theta = np.linspace(0.0, 2.0 * np.pi, SEGMENTS, endpoint=False)
+    ct, st = np.cos(theta), np.sin(theta)
+
+    # OUTER ANNULUS uses only the annulus-smoothed terrain/interpolator.
+    z_shift = shell.vertices[:, 2].max() - _ANNULUS_BASE_MAX_Z
+
+    def interpolate_border_height(points_xy):
+        return interpolate_annulus_terrain_height(points_xy, z_shift=z_shift)
+
+    top_outer_radius = OUTER_RADIUS_MM - TOP_BEVEL_MM
+    top_inner_radius = INNER_RADIUS_MM + TOP_BEVEL_MM
+
+    top_outer_xy = np.column_stack([top_outer_radius * ct, top_outer_radius * st])
+    top_inner_xy = np.column_stack([top_inner_radius * ct, top_inner_radius * st])
+    top_outer_z = interpolate_border_height(top_outer_xy)
+    top_inner_z = interpolate_border_height(top_inner_xy)
+    top_outer_loop = np.column_stack([top_outer_xy, top_outer_z])
+    top_inner_loop = np.column_stack([top_inner_xy, top_inner_z])
+
+    r = np.linalg.norm(shell.vertices[:, :2], axis=1)
+    terrain_points = shell.vertices[(r >= top_inner_radius) & (r <= top_outer_radius)]
+
+    if len(terrain_points) > 0:
+        points_xy = terrain_points[:, :2]
+        outer_dist, _ = cKDTree(top_outer_xy).query(points_xy, k=1)
+        inner_dist, _ = cKDTree(top_inner_xy).query(points_xy, k=1)
+        terrain_points = terrain_points[(outer_dist > 1e-6) & (inner_dist > 1e-6)]
+
+    cap_vertices = np.vstack([terrain_points, top_outer_loop, top_inner_loop])
+    top_outer_boundary_offset = len(terrain_points)
+    top_inner_boundary_offset = top_outer_boundary_offset + SEGMENTS
+
+    tri = Delaunay(cap_vertices[:, :2])
+    top_faces = tri.simplices
+    centers = np.mean(cap_vertices[top_faces][:, :, :2], axis=1)
+    center_r = np.linalg.norm(centers, axis=1)
+    top_faces = top_faces[(center_r <= top_outer_radius) & (center_r >= top_inner_radius)]
+
+    top_outer_bevel_rings = []
+    if TOP_BEVEL_MM > 0:
+        for k in range(1, TOP_BEVEL_SEGMENTS + 1):
+            phi = (np.pi / 2.0) * k / TOP_BEVEL_SEGMENTS
+            ring_r = OUTER_RADIUS_MM - TOP_BEVEL_MM + TOP_BEVEL_MM * np.sin(phi)
+            ring_xy = np.column_stack([ring_r * ct, ring_r * st])
+            terrain_ring_z = interpolate_border_height(ring_xy)
+            bevel_drop = TOP_BEVEL_MM * (1.0 - np.cos(phi))
+            top_outer_bevel_rings.append(
+                np.column_stack([ring_xy, terrain_ring_z - bevel_drop])
+            )
+
+    top_inner_bevel_rings = []
+    if TOP_BEVEL_MM > 0:
+        for k in range(1, TOP_BEVEL_SEGMENTS + 1):
+            phi = (np.pi / 2.0) * k / TOP_BEVEL_SEGMENTS
+            ring_r = INNER_RADIUS_MM + TOP_BEVEL_MM - TOP_BEVEL_MM * np.sin(phi)
+            ring_xy = np.column_stack([ring_r * ct, ring_r * st])
+            terrain_ring_z = interpolate_border_height(ring_xy)
+            bevel_drop = TOP_BEVEL_MM * (1.0 - np.cos(phi))
+            top_inner_bevel_rings.append(
+                np.column_stack([ring_xy, terrain_ring_z - bevel_drop])
+            )
+
+    bottom_outer_bevel_rings = []
+    if BEVEL_MM > 0:
+        for k in range(BEVEL_SEGMENTS):
+            phi = (np.pi / 2.0) * k / BEVEL_SEGMENTS
+            ring_r = OUTER_RADIUS_MM - BEVEL_MM + BEVEL_MM * np.cos(phi)
+            ring_z = BEVEL_MM - BEVEL_MM * np.sin(phi)
+            bottom_outer_bevel_rings.append(np.column_stack([
+                ring_r * ct,
+                ring_r * st,
+                np.full(SEGMENTS, ring_z),
+            ]))
+
+    bottom_inner_bevel_rings = []
+    if BEVEL_MM > 0:
+        for k in range(BEVEL_SEGMENTS):
+            phi = (np.pi / 2.0) * k / BEVEL_SEGMENTS
+            ring_r = INNER_RADIUS_MM + BEVEL_MM - BEVEL_MM * np.cos(phi)
+            ring_z = BEVEL_MM - BEVEL_MM * np.sin(phi)
+            bottom_inner_bevel_rings.append(np.column_stack([
+                ring_r * ct,
+                ring_r * st,
+                np.full(SEGMENTS, ring_z),
+            ]))
+
+    bottom_outer_radius = OUTER_RADIUS_MM - BEVEL_MM
+    bottom_inner_radius = INNER_RADIUS_MM + BEVEL_MM
+    bottom_outer_loop = np.column_stack([
+        bottom_outer_radius * ct,
+        bottom_outer_radius * st,
+        np.zeros(SEGMENTS),
+    ])
+    bottom_inner_loop = np.column_stack([
+        bottom_inner_radius * ct,
+        bottom_inner_radius * st,
+        np.zeros(SEGMENTS),
+    ])
+
+    parts = [cap_vertices]
+
+    def append_rings(rings):
+        offsets = []
+        for ring in rings:
+            offsets.append(sum(len(x) for x in parts))
+            parts.append(ring)
+        return offsets
+
+    top_outer_bevel_offsets = append_rings(top_outer_bevel_rings)
+    top_inner_bevel_offsets = append_rings(top_inner_bevel_rings)
+    bottom_outer_bevel_offsets = append_rings(bottom_outer_bevel_rings)
+    bottom_inner_bevel_offsets = append_rings(bottom_inner_bevel_rings)
+
+    bottom_outer_offset = sum(len(x) for x in parts)
+    parts.append(bottom_outer_loop)
+    bottom_inner_offset = sum(len(x) for x in parts)
+    parts.append(bottom_inner_loop)
+
+    all_vertices = np.vstack(parts)
+    all_faces = list(top_faces)
+
+    def connect_loops(offset_a, offset_b, reverse=False):
+        for i in range(SEGMENTS):
+            n = (i + 1) % SEGMENTS
+            a0, a1 = offset_a + i, offset_a + n
+            b0, b1 = offset_b + i, offset_b + n
+            if not reverse:
+                all_faces.append([a0, a1, b1])
+                all_faces.append([a0, b1, b0])
+            else:
+                all_faces.append([a0, b1, a1])
+                all_faces.append([a0, b0, b1])
+
+    previous_offset = top_outer_boundary_offset
+    for current_offset in top_outer_bevel_offsets:
+        connect_loops(previous_offset, current_offset, reverse=False)
+        previous_offset = current_offset
+    outer_wall_top_offset = previous_offset
+
+    previous_offset = top_inner_boundary_offset
+    for current_offset in top_inner_bevel_offsets:
+        connect_loops(previous_offset, current_offset, reverse=True)
+        previous_offset = current_offset
+    inner_wall_top_offset = previous_offset
+
+    outer_wall_bottom_offset = (
+        bottom_outer_bevel_offsets[0]
+        if bottom_outer_bevel_offsets else bottom_outer_offset
+    )
+    inner_wall_bottom_offset = (
+        bottom_inner_bevel_offsets[0]
+        if bottom_inner_bevel_offsets else bottom_inner_offset
+    )
+
+    connect_loops(outer_wall_top_offset, outer_wall_bottom_offset, reverse=False)
+    connect_loops(inner_wall_top_offset, inner_wall_bottom_offset, reverse=True)
+
+    for a_off, b_off in zip(bottom_outer_bevel_offsets[:-1], bottom_outer_bevel_offsets[1:]):
+        connect_loops(a_off, b_off, reverse=False)
+    if bottom_outer_bevel_offsets:
+        connect_loops(bottom_outer_bevel_offsets[-1], bottom_outer_offset, reverse=False)
+
+    for a_off, b_off in zip(bottom_inner_bevel_offsets[:-1], bottom_inner_bevel_offsets[1:]):
+        connect_loops(a_off, b_off, reverse=True)
+    if bottom_inner_bevel_offsets:
+        connect_loops(bottom_inner_bevel_offsets[-1], bottom_inner_offset, reverse=True)
+
+    connect_loops(bottom_outer_offset, bottom_inner_offset, reverse=True)
+
+    mesh = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=np.asarray(all_faces, dtype=np.int64),
+        process=False,
+    )
+
+    print("Cleaning annulus mesh...")
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+    mesh.merge_vertices()
+    mesh.merge_vertices(digits_vertex=6)
+    repair.fill_holes(mesh)
+    mesh.fix_normals()
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+# ============================================================
+# BUILD BOTH FROM THE SAME TIFF / COMMON TERRAIN
+# ============================================================
+
+print("\n\n>>> BUILDING INNER MODEL")
+_t_inner = time.perf_counter()
+inner_terrain = terrain_at_top_height(terrain_base, INNER_TOP_HEIGHT_MM)
+print("Inner terrain Z:", inner_terrain.vertices[:, 2].min(), inner_terrain.vertices[:, 2].max())
+inner_mesh = build_inner_model(inner_terrain)
+validate_mesh(inner_mesh, "INNER MODEL VALIDATION")
+print(f"Inner build time: {(time.perf_counter()-_t_inner)/60:.2f} min")
+
+print("\n\n>>> BUILDING OUTER ANNULUS")
+_t_annulus = time.perf_counter()
+annulus_terrain = terrain_at_top_height(terrain_base_annulus, ANNULUS_TOP_HEIGHT_MM)
+print("Annulus terrain Z:", annulus_terrain.vertices[:, 2].min(), annulus_terrain.vertices[:, 2].max())
+annulus_mesh = build_annulus_model(annulus_terrain)
+validate_mesh(annulus_mesh, "ANNULUS MODEL VALIDATION")
+print(f"Annulus build time: {(time.perf_counter()-_t_annulus)/60:.2f} min")
+
+# ============================================================
+# EXPORT + DOWNLOAD BOTH STL FILES
+# ============================================================
+
+inner_output = "terrain_inner_closed_cylinder.stl"
+annulus_output = "terrain_outer_annulus.stl"
+
+inner_mesh.export(inner_output)
+annulus_mesh.export(annulus_output)
+
+print("\nSaved:", inner_output)
+print("Saved:", annulus_output)
+print("\nDownloading both STL files...")
+
+files.download(inner_output)
+files.download(annulus_output)
+
+print(f"\nTotal runtime: {(time.perf_counter()-_t_total)/60:.2f} min")
+print("DONE - one TIFF produced two STL files.")
+
+# ============================================================
+# REAL-WORLD DISTANCE FOR 180 MM AT MODEL SCALE
+# ============================================================
+
+MODEL_LENGTH_MM = 180.0
+
+real_distance_km = MODEL_LENGTH_MM * MAP_SCALE / 1_000_000.0
+real_distance_miles = real_distance_km * 0.621371192237334
+
+print("\n================================")
+print("180 MM REAL-WORLD DISTANCE")
+print("================================")
+print(f"Model scale: 1 : {MAP_SCALE:,.0f}")
+print(f"Model length: {MODEL_LENGTH_MM:.1f} mm")
+print(f"Real distance: {real_distance_km:,.2f} km")
+print(f"Real distance: {real_distance_miles:,.2f} miles")
+print("================================")
