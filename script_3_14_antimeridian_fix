@@ -1,6 +1,7 @@
 # ============================================================
 # TouchTerrain -> INNER MODEL + OUTER ANNULUS
 # Combined script by Jan Mestan
+# Optimized version: vectorized loop-face generation; geometry/parameters preserved
 # Based on inner v3.10 and annulus v3.11 scripts
 # ============================================================
 
@@ -25,7 +26,7 @@ from google.colab import files
 
 EARTH_RADIUS_KM = 6371.0
 MODEL_WIDTH_MM = 333.0
-ZSCALE = 60
+ZSCALE = 120
 UPSCALE = 2
 
 # INNER MODEL
@@ -367,6 +368,37 @@ def validate_mesh(mesh, title):
 
 
 # ============================================================
+# VECTORIZED LOOP CONNECTIVITY
+# ============================================================
+def connect_loop_faces(offset_a, offset_b, segments=SEGMENTS, reverse=False):
+    """Return the same two triangles per loop segment as the original Python loops."""
+    i = np.arange(segments, dtype=np.int64)
+    n = (i + 1) % segments
+    a0 = offset_a + i
+    a1 = offset_a + n
+    b0 = offset_b + i
+    b1 = offset_b + n
+    if reverse:
+        return np.column_stack((
+            np.column_stack((a0, b1, a1)),
+            np.column_stack((a0, b0, b1)),
+        )).reshape(-1, 3)
+    return np.column_stack((
+        np.column_stack((a0, a1, b1)),
+        np.column_stack((a0, b1, b0)),
+    )).reshape(-1, 3)
+
+
+def bottom_fan_faces(center_id, bottom_offset, segments=SEGMENTS):
+    i = np.arange(segments, dtype=np.int64)
+    n = (i + 1) % segments
+    return np.column_stack((
+        np.full(segments, center_id, dtype=np.int64),
+        bottom_offset + n,
+        bottom_offset + i,
+    ))
+
+# ============================================================
 # OUTPUT 1: INNER CLOSED CYLINDER
 # ============================================================
 
@@ -378,10 +410,8 @@ def build_inner_model(shell):
     TOP_BEVEL_SEGMENTS = INNER_TOP_BEVEL_SEGMENTS
 
     theta = np.linspace(0, 2 * np.pi, SEGMENTS, endpoint=False)
-    circle_xy = np.column_stack([
-        BASE_RADIUS_MM * np.cos(theta),
-        BASE_RADIUS_MM * np.sin(theta),
-    ])
+    ct, st = np.cos(theta), np.sin(theta)
+    circle_xy = np.column_stack([BASE_RADIUS_MM * ct, BASE_RADIUS_MM * st])
 
     # XY geometry is unchanged by the output-specific vertical shift.
     # Reuse the common interpolator and add only that constant Z shift.
@@ -393,10 +423,7 @@ def build_inner_model(shell):
         raise ValueError("INNER_TOP_BEVEL_SEGMENTS must be >= 1")
 
     top_inner_radius = BASE_RADIUS_MM - TOP_BEVEL_MM
-    top_inner_xy = np.column_stack([
-        top_inner_radius * np.cos(theta),
-        top_inner_radius * np.sin(theta),
-    ])
+    top_inner_xy = np.column_stack([top_inner_radius * ct, top_inner_radius * st])
 
     def interpolate_border_height(points_xy):
         return interpolate_terrain_height(points_xy, z_shift=z_shift)
@@ -428,10 +455,7 @@ def build_inner_model(shell):
                 BASE_RADIUS_MM - TOP_BEVEL_MM
                 + TOP_BEVEL_MM * np.sin(phi)
             )
-            ring_xy = np.column_stack([
-                ring_r * np.cos(theta),
-                ring_r * np.sin(theta),
-            ])
+            ring_xy = np.column_stack([ring_r * ct, ring_r * st])
             terrain_ring_z = interpolate_border_height(ring_xy)
             bevel_drop = TOP_BEVEL_MM * (1.0 - np.cos(phi))
             ring_z = terrain_ring_z - bevel_drop
@@ -450,15 +474,15 @@ def build_inner_model(shell):
             ring_r = BASE_RADIUS_MM - BEVEL_MM + BEVEL_MM * np.cos(phi)
             ring_z = BEVEL_MM - BEVEL_MM * np.sin(phi)
             bevel_rings.append(np.column_stack([
-                ring_r * np.cos(theta),
-                ring_r * np.sin(theta),
+                ring_r * ct,
+                ring_r * st,
                 np.full(SEGMENTS, ring_z),
             ]))
 
     bottom_radius = BASE_RADIUS_MM - max(BEVEL_MM, 0)
     bottom_loop = np.column_stack([
-        bottom_radius * np.cos(theta),
-        bottom_radius * np.sin(theta),
+        bottom_radius * ct,
+        bottom_radius * st,
         np.zeros(SEGMENTS),
     ])
     bottom_center = np.array([[0.0, 0.0, 0.0]])
@@ -480,55 +504,32 @@ def build_inner_model(shell):
     parts.append(bottom_center)
 
     all_vertices = np.vstack(parts)
-    all_faces = list(top_faces)
+    face_parts = [np.asarray(top_faces, dtype=np.int64)]
 
     if top_bevel_offsets:
         previous_offset = top_boundary_offset
         for current_offset in top_bevel_offsets:
-            for i in range(SEGMENTS):
-                n = (i + 1) % SEGMENTS
-                a0, a1 = previous_offset + i, previous_offset + n
-                b0, b1 = current_offset + i, current_offset + n
-                all_faces.append([a0, a1, b1])
-                all_faces.append([a0, b1, b0])
+            face_parts.append(connect_loop_faces(previous_offset, current_offset))
             previous_offset = current_offset
         side_top_offset = top_bevel_offsets[-1]
     else:
         side_top_offset = top_boundary_offset
 
     side_bottom_offset = bevel_offsets[0] if bevel_offsets else bottom_offset
-
-    for i in range(SEGMENTS):
-        n = (i + 1) % SEGMENTS
-        top_a, top_b = side_top_offset + i, side_top_offset + n
-        low_a, low_b = side_bottom_offset + i, side_bottom_offset + n
-        all_faces.append([top_a, top_b, low_b])
-        all_faces.append([top_a, low_b, low_a])
+    face_parts.append(connect_loop_faces(side_top_offset, side_bottom_offset))
 
     for a_off, b_off in zip(bevel_offsets[:-1], bevel_offsets[1:]):
-        for i in range(SEGMENTS):
-            n = (i + 1) % SEGMENTS
-            a0, a1 = a_off + i, a_off + n
-            b0, b1 = b_off + i, b_off + n
-            all_faces.append([a0, a1, b1])
-            all_faces.append([a0, b1, b0])
+        face_parts.append(connect_loop_faces(a_off, b_off))
 
     if bevel_offsets:
-        last_off = bevel_offsets[-1]
-        for i in range(SEGMENTS):
-            n = (i + 1) % SEGMENTS
-            a0, a1 = last_off + i, last_off + n
-            b0, b1 = bottom_offset + i, bottom_offset + n
-            all_faces.append([a0, a1, b1])
-            all_faces.append([a0, b1, b0])
+        face_parts.append(connect_loop_faces(bevel_offsets[-1], bottom_offset))
 
-    for i in range(SEGMENTS):
-        n = (i + 1) % SEGMENTS
-        all_faces.append([center_id, bottom_offset + n, bottom_offset + i])
+    face_parts.append(bottom_fan_faces(center_id, bottom_offset))
+    all_faces = np.vstack(face_parts)
 
     mesh = trimesh.Trimesh(
         vertices=all_vertices,
-        faces=np.asarray(all_faces, dtype=np.int64),
+        faces=all_faces,
         process=False,
     )
 
@@ -688,29 +689,17 @@ def build_annulus_model(shell):
     parts.append(bottom_inner_loop)
 
     all_vertices = np.vstack(parts)
-    all_faces = list(top_faces)
-
-    def connect_loops(offset_a, offset_b, reverse=False):
-        for i in range(SEGMENTS):
-            n = (i + 1) % SEGMENTS
-            a0, a1 = offset_a + i, offset_a + n
-            b0, b1 = offset_b + i, offset_b + n
-            if not reverse:
-                all_faces.append([a0, a1, b1])
-                all_faces.append([a0, b1, b0])
-            else:
-                all_faces.append([a0, b1, a1])
-                all_faces.append([a0, b0, b1])
+    face_parts = [np.asarray(top_faces, dtype=np.int64)]
 
     previous_offset = top_outer_boundary_offset
     for current_offset in top_outer_bevel_offsets:
-        connect_loops(previous_offset, current_offset, reverse=False)
+        face_parts.append(connect_loop_faces(previous_offset, current_offset, reverse=False))
         previous_offset = current_offset
     outer_wall_top_offset = previous_offset
 
     previous_offset = top_inner_boundary_offset
     for current_offset in top_inner_bevel_offsets:
-        connect_loops(previous_offset, current_offset, reverse=True)
+        face_parts.append(connect_loop_faces(previous_offset, current_offset, reverse=True))
         previous_offset = current_offset
     inner_wall_top_offset = previous_offset
 
@@ -723,24 +712,25 @@ def build_annulus_model(shell):
         if bottom_inner_bevel_offsets else bottom_inner_offset
     )
 
-    connect_loops(outer_wall_top_offset, outer_wall_bottom_offset, reverse=False)
-    connect_loops(inner_wall_top_offset, inner_wall_bottom_offset, reverse=True)
+    face_parts.append(connect_loop_faces(outer_wall_top_offset, outer_wall_bottom_offset, reverse=False))
+    face_parts.append(connect_loop_faces(inner_wall_top_offset, inner_wall_bottom_offset, reverse=True))
 
     for a_off, b_off in zip(bottom_outer_bevel_offsets[:-1], bottom_outer_bevel_offsets[1:]):
-        connect_loops(a_off, b_off, reverse=False)
+        face_parts.append(connect_loop_faces(a_off, b_off, reverse=False))
     if bottom_outer_bevel_offsets:
-        connect_loops(bottom_outer_bevel_offsets[-1], bottom_outer_offset, reverse=False)
+        face_parts.append(connect_loop_faces(bottom_outer_bevel_offsets[-1], bottom_outer_offset, reverse=False))
 
     for a_off, b_off in zip(bottom_inner_bevel_offsets[:-1], bottom_inner_bevel_offsets[1:]):
-        connect_loops(a_off, b_off, reverse=True)
+        face_parts.append(connect_loop_faces(a_off, b_off, reverse=True))
     if bottom_inner_bevel_offsets:
-        connect_loops(bottom_inner_bevel_offsets[-1], bottom_inner_offset, reverse=True)
+        face_parts.append(connect_loop_faces(bottom_inner_bevel_offsets[-1], bottom_inner_offset, reverse=True))
 
-    connect_loops(bottom_outer_offset, bottom_inner_offset, reverse=True)
+    face_parts.append(connect_loop_faces(bottom_outer_offset, bottom_inner_offset, reverse=True))
+    all_faces = np.vstack(face_parts)
 
     mesh = trimesh.Trimesh(
         vertices=all_vertices,
-        faces=np.asarray(all_faces, dtype=np.int64),
+        faces=all_faces,
         process=False,
     )
 
