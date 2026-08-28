@@ -12,7 +12,7 @@ import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from scipy.ndimage import zoom, gaussian_filter
 from affine import Affine
-from pyproj import Geod
+from pyproj import Geod, Transformer, CRS
 from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import Delaunay, cKDTree
 import trimesh
@@ -25,7 +25,7 @@ from google.colab import files
 
 EARTH_RADIUS_KM = 6371.0
 MODEL_WIDTH_MM = 333.0
-ZSCALE = 1
+ZSCALE = 60
 UPSCALE = 2
 
 # INNER MODEL
@@ -70,6 +70,10 @@ with rasterio.open(tif_file) as src:
     print("\nOriginal CRS:")
     print(src.crs)
 
+    if src.crs is None:
+        raise RuntimeError("TIFF has no CRS/georeferencing.")
+
+    source_crs = src.crs
     elevation = src.read(1).astype(np.float64)
     if src.nodata is not None:
         elevation[np.isclose(elevation, src.nodata)] = np.nan
@@ -77,30 +81,21 @@ with rasterio.open(tif_file) as src:
 
     print("Elevation range:", np.nanmin(elevation), np.nanmax(elevation))
 
-    dst_crs = "EPSG:4326"
-    transform, width, height = calculate_default_transform(
-        src.crs, dst_crs, src.width, src.height, *src.bounds
-    )
+    # IMPORTANT FOR LARGE GMTED2010 TILES:
+    # Keep the ORIGINAL raster grid. Reprojecting the full raster into an
+    # EPSG:4326 rectangle can wrap/split data at +/-180 degrees and produce
+    # a false longitude span. Instead, only transform each pixel center to
+    # lon/lat after optional upscaling.
+    transform = src.transform
 
-    reprojected = np.empty((height, width), dtype=np.float64)
-    reproject(
-        source=elevation,
-        destination=reprojected,
-        src_transform=src.transform,
-        src_crs=src.crs,
-        dst_transform=transform,
-        dst_crs=dst_crs,
-        resampling=Resampling.bilinear,
-    )
+print("Before upscale:", elevation.shape)
 
-print("Before upscale:", reprojected.shape)
-
-reprojected = zoom(reprojected, UPSCALE, order=3)
+reprojected = zoom(elevation, UPSCALE, order=3)
 transform = Affine(
     transform.a / UPSCALE,
-    transform.b,
+    transform.b / UPSCALE,
     transform.c,
-    transform.d,
+    transform.d / UPSCALE,
     transform.e / UPSCALE,
     transform.f,
 )
@@ -135,86 +130,79 @@ def gaussian_filter_nan(data, sigma):
 reprojected_annulus = gaussian_filter_nan(reprojected, ANNULUS_SMOOTH_SIGMA)
 print("Annulus-only Gaussian sigma:", ANNULUS_SMOOTH_SIGMA)
 
-# Lat/lon grid
+# Coordinates of every UPSCALED pixel center in the TIFF's ORIGINAL CRS.
 rows, cols = np.indices(reprojected.shape)
 xs, ys = rasterio.transform.xy(transform, rows, cols)
-lon = np.array(xs).reshape(reprojected.shape)
-lat = np.array(ys).reshape(reprojected.shape)
+x_src = np.asarray(xs, dtype=np.float64).reshape(reprojected.shape)
+y_src = np.asarray(ys, dtype=np.float64).reshape(reprojected.shape)
 
-mask = np.isfinite(reprojected)
+# Convert coordinates point-by-point to WGS84 without warping the raster.
+to_wgs84 = Transformer.from_crs(source_crs, "EPSG:4326", always_xy=True)
+lon, lat = to_wgs84.transform(x_src, y_src)
+lon = np.asarray(lon, dtype=np.float64)
+lat = np.asarray(lat, dtype=np.float64)
+
+mask = np.isfinite(reprojected) & np.isfinite(lon) & np.isfinite(lat)
 lon_valid = lon[mask]
 lat_valid = lat[mask]
 elev_valid = reprojected[mask]
 elev_annulus_valid = reprojected_annulus[mask]
 
-# Model scale
-# Robust calculation based on the ORIGINAL source raster extent.
-# For projected CRS with linear units in metres (e.g. UTM), use the raster
-# width directly in source coordinates. This avoids antimeridian problems
-# caused by reprojection to EPSG:4326.
-#
-# For geographic CRS, fall back to a geodesic width calculation using the
-# raster bounds and the latitude at the vertical center of the raster.
+print("WGS84 longitude range:", np.nanmin(lon_valid), np.nanmax(lon_valid))
+print("WGS84 latitude range:", np.nanmin(lat_valid), np.nanmax(lat_valid))
 
-with rasterio.open(tif_file) as src_scale:
-    src_bounds = src_scale.bounds
-    src_crs_scale = src_scale.crs
+# ------------------------------------------------------------------
+# ROBUST MODEL SCALE
+# ------------------------------------------------------------------
+# Measure the real-world width between the left and right pixel centers
+# of the raster near its vertical center. This remains correct when the
+# raster crosses +/-180 degrees because Geod.inv handles longitude wrap.
+geod = Geod(ellps="WGS84")
+h_src, w_src = reprojected.shape
+center_row = h_src // 2
 
-    if src_crs_scale is None:
-        raise ValueError("TIFF has no CRS; cannot determine model scale reliably.")
+# Prefer valid pixels on the center row. If there are holes, use the
+# nearest row containing at least two valid pixels.
+row_for_scale = None
+for delta in range(h_src):
+    candidates = [center_row - delta, center_row + delta] if delta else [center_row]
+    for rr in candidates:
+        if rr < 0 or rr >= h_src:
+            continue
+        valid_cols = np.flatnonzero(mask[rr])
+        if len(valid_cols) >= 2:
+            row_for_scale = rr
+            left_col = int(valid_cols[0])
+            right_col = int(valid_cols[-1])
+            break
+    if row_for_scale is not None:
+        break
 
-    if src_crs_scale.is_projected:
-        # Determine conversion from CRS linear units to metres.
-        # For EPSG:32753 this factor is exactly 1.0 (metres).
-        linear_factor_to_m = 1.0
+if row_for_scale is None:
+    raise RuntimeError("Could not find a valid raster row for scale calculation.")
 
-        try:
-            if src_crs_scale.linear_units_factor:
-                # rasterio/pyproj commonly returns e.g. ('metre', 1.0)
-                linear_factor_to_m = float(src_crs_scale.linear_units_factor[1])
-        except Exception:
-            pass
+lon_left = float(lon[row_for_scale, left_col])
+lat_left = float(lat[row_for_scale, left_col])
+lon_right = float(lon[row_for_scale, right_col])
+lat_right = float(lat[row_for_scale, right_col])
 
-        physical_width_m = abs(src_bounds.right - src_bounds.left) * linear_factor_to_m
+_, _, distance_m = geod.inv(lon_left, lat_left, lon_right, lat_right)
+distance_m = abs(float(distance_m))
 
-    elif src_crs_scale.is_geographic:
-        geod = Geod(ellps="WGS84")
+if not np.isfinite(distance_m) or distance_m <= 0:
+    raise RuntimeError("Invalid physical width calculated from TIFF georeferencing.")
 
-        lon_left = src_bounds.left
-        lon_right = src_bounds.right
-        lat_center = 0.5 * (src_bounds.bottom + src_bounds.top)
+physical_width_mm = distance_m * 1000.0
+scale = MODEL_WIDTH_MM / physical_width_mm
+MAP_SCALE = 1.0 / scale
 
-        # Normalize longitude span so antimeridian-crossing rasters use the
-        # intended continuous span rather than an accidental near-360° extent.
-        lon_span = lon_right - lon_left
-        if lon_span > 180.0:
-            lon_right -= 360.0
-        elif lon_span < -180.0:
-            lon_right += 360.0
-
-        _, _, physical_width_m = geod.inv(
-            lon_left, lat_center,
-            lon_right, lat_center
-        )
-        physical_width_m = abs(physical_width_m)
-
-    else:
-        raise ValueError(
-            f"Unsupported CRS type for automatic scale calculation: {src_crs_scale}"
-        )
-
-if not np.isfinite(physical_width_m) or physical_width_m <= 0:
-    raise ValueError(f"Invalid physical raster width: {physical_width_m}")
-
-physical_width_mm = physical_width_m * 1000.0
-MAP_SCALE = physical_width_mm / MODEL_WIDTH_MM
-scale = 1.0 / MAP_SCALE
-
-print("\n=== MODEL SCALE ===")
-print("Source CRS:", src_crs_scale)
-print(f"Physical raster width: {physical_width_m / 1000.0:,.3f} km")
-print(f"Model width: {MODEL_WIDTH_MM:.3f} mm")
-print(f"Model scale 1 : {MAP_SCALE:,.2f}")
+print("\n=== ROBUST SCALE FROM TIFF CENTER ROW ===")
+print("Scale row:", row_for_scale)
+print("Left lon/lat:", lon_left, lat_left)
+print("Right lon/lat:", lon_right, lat_right)
+print("Physical raster width [km]:", distance_m / 1000.0)
+print("Model width [mm]:", MODEL_WIDTH_MM)
+print("Model scale 1:", MAP_SCALE)
 
 # Spherical terrain
 lon_r = np.deg2rad(lon_valid)
