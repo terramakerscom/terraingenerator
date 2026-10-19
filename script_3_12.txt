@@ -5,7 +5,7 @@
 # Based on inner v3.10 and annulus v3.11 scripts
 # ============================================================
 
-!pip install rasterio pyproj numpy scipy trimesh pillow affine --quiet
+!pip install rasterio pyproj numpy scipy trimesh pillow affine "shapely>=2.1" --quiet
 
 import time
 import numpy as np
@@ -18,6 +18,8 @@ from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import Delaunay, cKDTree
 import trimesh
 import trimesh.repair as repair
+import shapely
+from shapely.geometry import Polygon
 from google.colab import files
 
 # ============================================================
@@ -25,30 +27,71 @@ from google.colab import files
 # ============================================================
 
 EARTH_RADIUS_KM = 6371.0
-MODEL_WIDTH_MM = 195
-ZSCALE = 60
+MODEL_WIDTH_MM = 240
+ZSCALE = 100
 UPSCALE = 2
 
 # INNER MODEL
 INNER_TOP_HEIGHT_MM = 50.0
 INNER_BASE_DIAMETER_MM = 180.0
+# NEW: base diameter used by the INNER model with EAST + WEST + SOUTH holes.
+# Set this to the desired second base diameter.
+INNER_BASE_DIAMETER2_MM = 190.0
 INNER_BEVEL_MM = 2.4
 INNER_BEVEL_SEGMENTS = 20
 INNER_TOP_BEVEL_MM = 2.4
 INNER_TOP_BEVEL_SEGMENTS = 20
 
+# INNER BOTTOM BLIND HOLE WITH HEMISPHERICAL END
+# Final orientation is +X=EAST, +Y=NORTH, so SOUTH is -Y.
+INNER_BOTTOM_HOLE_DIAMETER_MM = 4.0
+INNER_BOTTOM_HOLE_CENTER_DISTANCE_MM = 84.0
+INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM = 89.0
+# Straight cylindrical part before the hemispherical end begins.
+INNER_BOTTOM_HOLE_DEPTH_MM = 2.56
+# Number of latitude rings used for the hemisphere (higher = smoother).
+INNER_BOTTOM_HOLE_HEMISPHERE_SEGMENTS = 24
+
 # OUTER ANNULUS
+# This annulus belongs to INNER_BASE_DIAMETER_MM.
 ANNULUS_TOP_HEIGHT_MM = 53.0
-ANNULUS_OUTER_DIAMETER_MM = 190.4
-ANNULUS_INNER_DIAMETER_MM = 180.4
-ANNULUS_BEVEL_MM = 2.4
+ANNULUS_OUTER_DIAMETER_MM = 190.45
+ANNULUS_INNER_DIAMETER_CLEARANCE_MM = 0.45
+ANNULUS_INNER_DIAMETER_MM = (
+    INNER_BASE_DIAMETER_MM + ANNULUS_INNER_DIAMETER_CLEARANCE_MM
+)
+ANNULUS_BEVEL_MM = 0.8
 ANNULUS_BEVEL_SEGMENTS = 20
 ANNULUS_TOP_BEVEL_MM = 2.499
 ANNULUS_TOP_BEVEL_SEGMENTS = 20
 ANNULUS_SMOOTH_SIGMA = 2.0  # Gaussian smoothing ONLY for outer annulus; 0 = off
 
+# OUTER ANNULUS 2 - NO BOTTOM INNER BEVEL
+# This annulus belongs to INNER_BASE_DIAMETER2_MM.
+# Preserve the original diametral clearance between INNER and annulus.
+ANNULUS2_TOP_HEIGHT_MM = 50.5
+ANNULUS2_OUTER_DIAMETER_MM = 194.60
+ANNULUS2_INNER_DIAMETER_CLEARANCE_MM = 0.60
+ANNULUS2_INNER_DIAMETER_MM = (
+    INNER_BASE_DIAMETER2_MM + ANNULUS2_INNER_DIAMETER_CLEARANCE_MM
+)
+ANNULUS2_OUTER_BOTTOM_BEVEL_MM = 0.4
+ANNULUS2_OUTER_BOTTOM_BEVEL_SEGMENTS = 20
+ANNULUS2_TOP_BEVEL_MM = 0.499
+ANNULUS2_TOP_BEVEL_SEGMENTS = 20
+ANNULUS2_SMOOTH_SIGMA = 2.0  # Gaussian smoothing ONLY for annulus 2; 0 = off
+
 # Angular resolution used by both output meshes
-SEGMENTS = 4096
+SEGMENTS = 512
+
+# Validate the two-diameter setup early.
+if INNER_BASE_DIAMETER_MM <= 0 or INNER_BASE_DIAMETER2_MM <= 0:
+    raise ValueError("Both INNER base diameters must be > 0")
+if np.isclose(INNER_BASE_DIAMETER_MM, INNER_BASE_DIAMETER2_MM):
+    print(
+        "WARNING: INNER_BASE_DIAMETER_MM and INNER_BASE_DIAMETER2_MM are equal; "
+        "the two INNER outputs will therefore have the same base diameter."
+    )
 
 # ============================================================
 # UPLOAD TIFF ONCE
@@ -129,7 +172,9 @@ def gaussian_filter_nan(data, sigma):
 
 
 reprojected_annulus = gaussian_filter_nan(reprojected, ANNULUS_SMOOTH_SIGMA)
+reprojected_annulus2 = gaussian_filter_nan(reprojected, ANNULUS2_SMOOTH_SIGMA)
 print("Annulus-only Gaussian sigma:", ANNULUS_SMOOTH_SIGMA)
+print("Annulus 2-only Gaussian sigma:", ANNULUS2_SMOOTH_SIGMA)
 
 # Coordinates of every UPSCALED pixel center in the TIFF's ORIGINAL CRS.
 rows, cols = np.indices(reprojected.shape)
@@ -148,6 +193,7 @@ lon_valid = lon[mask]
 lat_valid = lat[mask]
 elev_valid = reprojected[mask]
 elev_annulus_valid = reprojected_annulus[mask]
+elev_annulus2_valid = reprojected_annulus2[mask]
 
 print("WGS84 longitude range:", np.nanmin(lon_valid), np.nanmax(lon_valid))
 print("WGS84 latitude range:", np.nanmin(lat_valid), np.nanmax(lat_valid))
@@ -228,6 +274,16 @@ Y_annulus = annulus_radius * np.cos(lat_r) * np.sin(lon_r)
 Z_annulus = annulus_radius * np.sin(lat_r)
 vertices_annulus = np.column_stack([X_annulus, Y_annulus, Z_annulus])
 
+# Separate spherical terrain for OUTER ANNULUS 2, with its own smoothing.
+annulus2_terrain_height_m = elev_annulus2_valid * ZSCALE
+annulus2_terrain_height_mm = annulus2_terrain_height_m * 1000.0 / MAP_SCALE
+annulus2_radius = earth_radius_mm + annulus2_terrain_height_mm
+
+X_annulus2 = annulus2_radius * np.cos(lat_r) * np.cos(lon_r)
+Y_annulus2 = annulus2_radius * np.cos(lat_r) * np.sin(lon_r)
+Z_annulus2 = annulus2_radius * np.sin(lat_r)
+vertices_annulus2 = np.column_stack([X_annulus2, Y_annulus2, Z_annulus2])
+
 # True sphere scale info
 distances = np.linalg.norm(vertices, axis=1)
 model_radius_mm = np.mean(distances)
@@ -264,59 +320,59 @@ terrain_base_annulus = trimesh.Trimesh(
     faces=faces.copy(),
     process=False,
 )
+terrain_base_annulus2 = trimesh.Trimesh(
+    vertices=vertices_annulus2,
+    faces=faces.copy(),
+    process=False,
+)
 
-# Clean both meshes independently while keeping their geometry aligned.
-for _mesh in (terrain_base, terrain_base_annulus):
+# Clean all three terrain meshes independently while keeping their geometry aligned.
+for _mesh in (terrain_base, terrain_base_annulus, terrain_base_annulus2):
     _mesh.update_faces(_mesh.unique_faces())
     valid_faces = _mesh.area_faces > 1e-12
     _mesh.update_faces(valid_faces)
     _mesh.remove_unreferenced_vertices()
 
 # ============================================================
-# ROBUST GLOBAL ORIENTATION: LOCAL EAST-NORTH-UP (ENU)
+# EXACT TANGENT-PLANE ORIENTATION: LOCAL EAST-NORTH-UP (ENU)
 # ============================================================
 # Goal for every final STL:
 #   +X = EAST
 #   +Y = NORTH
 #   +Z = UP (away from Earth's center)
 #
-# The model center is computed as a spherical centroid of ALL valid raster
-# pixels, not by averaging longitude/latitude. This is robust across the
-# +/-180 degree antimeridian and at very high latitudes.
+# IMPORTANT GEOMETRIC CONDITION:
+# The circular INNER/ANNULUS cut is centered on XY=(0, 0).  The tangent plane
+# through that center must therefore be the XY plane, and its normal (+/-Z)
+# must pass EXACTLY through the center of the modeled Earth sphere.
 #
-# At the exact geographic poles a unique tangent-plane NORTH direction does
-# not mathematically exist. In that singular case we use a deterministic
-# reference-meridian convention, so the output orientation still remains
-# repeatable and identical for INNER and ANNULUS.
+# The previous version first oriented the raster using a spherical pixel
+# centroid and then translated by the full 3-D mesh centroid.  The X/Y part of
+# that translation moved the Earth center away from the Z axis.  Consequently
+# the normal through the cut center no longer pointed exactly at the sphere
+# center.
+#
+# Fix: use the actual terrain-surface centroid (the same physical center that
+# the old code subsequently moved to the origin) to define the radial UP
+# direction BEFORE any translation.  We then build an exact ENU frame at that
+# direction.  After the rotation, this center lies on the Z axis, so only a
+# Z translation is needed.  The Earth center therefore remains exactly on the
+# Z axis below the cut center.
 
-def robust_local_enu_frame(lon_deg, lat_deg, pole_eps=1e-10):
-    lon_rad = np.deg2rad(np.asarray(lon_deg, dtype=np.float64))
-    lat_rad = np.deg2rad(np.asarray(lat_deg, dtype=np.float64))
 
-    # Unit vectors from Earth center to every valid raster pixel.
-    clat = np.cos(lat_rad)
-    unit_xyz = np.column_stack([
-        clat * np.cos(lon_rad),
-        clat * np.sin(lon_rad),
-        np.sin(lat_rad),
-    ])
+def exact_local_enu_frame_from_center(center_xyz, lon_deg_for_pole_fallback, pole_eps=1e-10):
+    center_xyz = np.asarray(center_xyz, dtype=np.float64).reshape(3)
+    center_norm = np.linalg.norm(center_xyz)
+    if not np.isfinite(center_norm) or center_norm < 1e-12:
+        raise RuntimeError("Could not determine a valid 3-D center for the terrain patch.")
 
-    # Spherical centroid direction. This avoids longitude wrap problems.
-    mean_xyz = np.mean(unit_xyz, axis=0)
-    mean_norm = np.linalg.norm(mean_xyz)
-    if not np.isfinite(mean_norm) or mean_norm < 1e-12:
-        raise RuntimeError(
-            "Could not determine a unique spherical center for the raster. "
-            "The valid pixels may cover an almost perfectly symmetric portion of Earth."
-        )
-
-    up = mean_xyz / mean_norm
+    # Radial direction from Earth center to the chosen cut center.
+    up = center_xyz / center_norm
 
     center_lat_rad = np.arcsin(np.clip(up[2], -1.0, 1.0))
     horizontal_norm = np.hypot(up[0], up[1])
 
     if horizontal_norm > pole_eps:
-        # Normal case: longitude of the spherical centroid is well defined.
         center_lon_rad = np.arctan2(up[1], up[0])
 
         # EAST = increasing longitude.
@@ -325,21 +381,21 @@ def robust_local_enu_frame(lon_deg, lat_deg, pole_eps=1e-10):
              np.cos(center_lon_rad),
              0.0,
         ], dtype=np.float64)
+        east /= np.linalg.norm(east)
 
-        # NORTH = projection of Earth's north-axis onto the local tangent plane.
+        # NORTH = projection of Earth's north axis onto the tangent plane.
         earth_north_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         north = earth_north_axis - np.dot(earth_north_axis, up) * up
         north_norm = np.linalg.norm(north)
         if north_norm < 1e-12:
             raise RuntimeError("Numerical failure while constructing local NORTH axis.")
         north /= north_norm
-        east /= np.linalg.norm(east)
 
         pole_fallback_used = False
     else:
-        # Exact/near pole: tangent-plane geographic NORTH is singular.
-        # Derive a deterministic reference meridian from the raster's longitude
-        # distribution. If that is also symmetric, fall back to Greenwich (0 deg).
+        # Exact/near pole: geographic EAST/NORTH is singular.  Keep a
+        # deterministic reference meridian derived from the raster longitudes.
+        lon_rad = np.deg2rad(np.asarray(lon_deg_for_pole_fallback, dtype=np.float64))
         mean_sin_lon = np.mean(np.sin(lon_rad))
         mean_cos_lon = np.mean(np.cos(lon_rad))
         lon_resultant = np.hypot(mean_sin_lon, mean_cos_lon)
@@ -359,7 +415,6 @@ def robust_local_enu_frame(lon_deg, lat_deg, pole_eps=1e-10):
         # Keep a right-handed frame: east x north = up.
         north = np.cross(up, east)
         north /= np.linalg.norm(north)
-
         pole_fallback_used = True
 
     # Final orthogonalization for numerical safety.
@@ -391,16 +446,27 @@ def robust_local_enu_frame(lon_deg, lat_deg, pole_eps=1e-10):
             f"det={determinant}"
         )
 
-    return rotation_3x3, center_lon_deg, center_lat_deg, pole_fallback_used
+    return (
+        rotation_3x3,
+        center_lon_deg,
+        center_lat_deg,
+        pole_fallback_used,
+        center_norm,
+    )
 
 
-R_ENU, model_center_lon, model_center_lat, pole_fallback_used = robust_local_enu_frame(
-    lon_valid, lat_valid
+# The OLD code eventually translated by -terrain_base.centroid.  Therefore
+# this centroid is the physical center around which the existing model was
+# being centered/cut.  Use that same center to define the exact tangent frame.
+cut_center_ecef = terrain_base.centroid.copy()
+
+R_ENU, model_center_lon, model_center_lat, pole_fallback_used, cut_center_radius = (
+    exact_local_enu_frame_from_center(cut_center_ecef, lon_valid)
 )
 
-print("\n=== ROBUST GLOBAL MODEL ORIENTATION ===")
-print("Spherical center longitude:", model_center_lon)
-print("Spherical center latitude :", model_center_lat)
+print("\n=== EXACT TANGENT-PLANE MODEL ORIENTATION ===")
+print("Cut-center longitude:", model_center_lon)
+print("Cut-center latitude :", model_center_lat)
 print("Final +X = EAST")
 print("Final +Y = NORTH")
 print("Final +Z = UP")
@@ -413,18 +479,47 @@ if pole_fallback_used:
 enu_matrix = np.eye(4, dtype=np.float64)
 enu_matrix[:3, :3] = R_ENU
 
-# Apply EXACTLY the same transform to original and smoothed terrain.
+# Apply EXACTLY the same rigid rotation to original and smoothed terrain.
+assert "terrain_base_annulus2" in globals(), "ANNULUS2 mesh was not initialized before ENU transform"
 terrain_base.apply_transform(enu_matrix)
 terrain_base_annulus.apply_transform(enu_matrix)
+terrain_base_annulus2.apply_transform(enu_matrix)
 
-# Translate both with the same vector so INNER and ANNULUS remain aligned.
-common_translation = -terrain_base.centroid.copy()
+# Because the third row of R_ENU is exactly the radial UP vector through the
+# chosen center, R_ENU @ cut_center_ecef is mathematically [0, 0, radius].
+# Translate ONLY along Z.  This is the crucial part: the modeled sphere center
+# remains at X=0, Y=0, so the line normal to the XY tangent plane through the
+# circular cut center passes exactly through the sphere center.
+common_translation = np.array([0.0, 0.0, -cut_center_radius], dtype=np.float64)
 terrain_base.apply_translation(common_translation)
 terrain_base_annulus.apply_translation(common_translation)
+terrain_base_annulus2.apply_translation(common_translation)
+
+# Numerical verification of the requested condition.
+# Earth center started at [0,0,0]. Rotation leaves it at the origin; after the
+# common translation it is therefore exactly at common_translation.
+sphere_center_final = common_translation.copy()
+rotated_cut_center = R_ENU @ cut_center_ecef + common_translation
+axis_offset_mm = float(np.linalg.norm(sphere_center_final[:2]))
+cut_center_xy_residual_mm = float(np.linalg.norm(rotated_cut_center[:2]))
+
+print("\n=== TANGENT / SPHERE-CENTER ALIGNMENT CHECK ===")
+print("Sphere center in final coordinates [mm]:", sphere_center_final)
+print("Chosen cut center after transform [mm]:", rotated_cut_center)
+print("Sphere-center XY offset from cut normal [mm]:", axis_offset_mm)
+print("Cut-center numerical XY residual [mm]:", cut_center_xy_residual_mm)
+
+if axis_offset_mm > 1e-10:
+    raise RuntimeError(
+        "Tangent alignment failed: modeled sphere center is not on the cut-center Z axis."
+    )
+
+print("Alignment OK: tangent-plane normal through cut center points exactly to sphere center.")
 
 print("\nCommon terrain prepared:")
 print("Inner/original:", terrain_base)
 print("Outer/smoothed:", terrain_base_annulus)
+print("Outer annulus 2/smoothed:", terrain_base_annulus2)
 
 # ============================================================
 # FAST TERRAIN INTERPOLATOR - BUILT ONCE, REUSED EVERYWHERE
@@ -450,6 +545,17 @@ _annulus_terrain_linear = LinearNDInterpolator(
 _annulus_terrain_nearest_tree = cKDTree(_annulus_base_xy)
 _ANNULUS_BASE_MAX_Z = _annulus_base_z.max()
 
+_annulus2_base_xy = terrain_base_annulus2.vertices[:, :2]
+_annulus2_base_z = terrain_base_annulus2.vertices[:, 2]
+print("Building annulus 2-smoothed terrain interpolator...")
+_annulus2_terrain_linear = LinearNDInterpolator(
+    _annulus2_base_xy,
+    _annulus2_base_z,
+    fill_value=np.nan,
+)
+_annulus2_terrain_nearest_tree = cKDTree(_annulus2_base_xy)
+_ANNULUS2_BASE_MAX_Z = _annulus2_base_z.max()
+
 print("Reusable terrain interpolators ready.")
 
 
@@ -473,6 +579,20 @@ def interpolate_annulus_terrain_height(points_xy, z_shift=0.0):
     if np.any(missing):
         _, nearest_idx = _annulus_terrain_nearest_tree.query(points_xy[missing], k=1)
         values[missing] = _annulus_base_z[nearest_idx]
+    if z_shift != 0.0:
+        values = values + z_shift
+    return values
+
+
+def interpolate_annulus2_terrain_height(points_xy, z_shift=0.0):
+    values = np.asarray(
+        _annulus2_terrain_linear(points_xy),
+        dtype=np.float64,
+    ).reshape(-1)
+    missing = ~np.isfinite(values)
+    if np.any(missing):
+        _, nearest_idx = _annulus2_terrain_nearest_tree.query(points_xy[missing], k=1)
+        values[missing] = _annulus2_base_z[nearest_idx]
     if z_shift != 0.0:
         values = values + z_shift
     return values
@@ -533,19 +653,31 @@ def bottom_fan_faces(center_id, bottom_offset, segments=SEGMENTS):
 # OUTPUT 1: INNER CLOSED CYLINDER
 # ============================================================
 
-def build_inner_model(shell):
-    BASE_RADIUS_MM = INNER_BASE_DIAMETER_MM / 2.0
+def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="INNER"):
+    """Build one INNER solid with one or more blind hemispherical-ended holes.
+
+    hole_centers_xy is an iterable of (x, y) centers in final model coordinates:
+      +X = EAST, -X = WEST, +Y = NORTH, -Y = SOUTH.
+
+    base_diameter_mm selects which INNER base diameter this variant uses.
+    """
+    BASE_RADIUS_MM = float(base_diameter_mm) / 2.0
     BEVEL_MM = INNER_BEVEL_MM
     BEVEL_SEGMENTS = INNER_BEVEL_SEGMENTS
     TOP_BEVEL_MM = INNER_TOP_BEVEL_MM
     TOP_BEVEL_SEGMENTS = INNER_TOP_BEVEL_SEGMENTS
+    HOLE_RADIUS_MM = INNER_BOTTOM_HOLE_DIAMETER_MM / 2.0
+    HOLE_DEPTH_MM = INNER_BOTTOM_HOLE_DEPTH_MM
+    HOLE_HEMISPHERE_SEGMENTS = INNER_BOTTOM_HOLE_HEMISPHERE_SEGMENTS
+
+    hole_centers_xy = np.asarray(hole_centers_xy, dtype=np.float64).reshape(-1, 2)
+    if len(hole_centers_xy) < 1:
+        raise ValueError("At least one INNER bottom-hole center is required")
 
     theta = np.linspace(0, 2 * np.pi, SEGMENTS, endpoint=False)
     ct, st = np.cos(theta), np.sin(theta)
-    circle_xy = np.column_stack([BASE_RADIUS_MM * ct, BASE_RADIUS_MM * st])
 
     # XY geometry is unchanged by the output-specific vertical shift.
-    # Reuse the common interpolator and add only that constant Z shift.
     z_shift = shell.vertices[:, 2].max() - _BASE_MAX_Z
 
     if TOP_BEVEL_MM < 0 or TOP_BEVEL_MM >= BASE_RADIUS_MM:
@@ -616,9 +748,97 @@ def build_inner_model(shell):
         bottom_radius * st,
         np.zeros(SEGMENTS),
     ])
-    bottom_center = np.array([[0.0, 0.0, 0.0]])
+
+    # ------------------------------------------------------------
+    # BLIND HOLES FROM THE BOTTOM, EACH WITH A TRUE HEMISPHERICAL END
+    # Diameter = 4 mm by default.
+    # Straight cylindrical wall: Z=0 ... Z=HOLE_DEPTH_MM.
+    # Hemisphere radius = hole radius, extending another radius upward.
+    # Every cavity is closed, so the resulting mesh remains watertight.
+    # ------------------------------------------------------------
+    if HOLE_RADIUS_MM <= 0:
+        raise ValueError("INNER_BOTTOM_HOLE_DIAMETER_MM must be > 0")
+    if HOLE_DEPTH_MM <= 0:
+        raise ValueError("INNER_BOTTOM_HOLE_DEPTH_MM must be > 0")
+    if HOLE_HEMISPHERE_SEGMENTS < 2:
+        raise ValueError("INNER_BOTTOM_HOLE_HEMISPHERE_SEGMENTS must be >= 2")
+
+    # Every complete opening must remain inside the flat bottom and different
+    # openings must not touch or overlap one another.
+    center_distances = np.linalg.norm(hole_centers_xy, axis=1)
+    outer_extents = center_distances + HOLE_RADIUS_MM
+    if np.any(outer_extents >= bottom_radius):
+        bad = int(np.argmax(outer_extents))
+        raise ValueError(
+            f"{variant_name}: bottom hole {bad + 1} intersects the lower bevel: "
+            f"center distance + hole radius = {outer_extents[bad]:.3f} mm, "
+            f"flat-bottom radius = {bottom_radius:.3f} mm"
+        )
+
+    if len(hole_centers_xy) > 1:
+        delta = hole_centers_xy[:, None, :] - hole_centers_xy[None, :, :]
+        pair_dist = np.linalg.norm(delta, axis=2)
+        np.fill_diagonal(pair_dist, np.inf)
+        min_pair = float(np.min(pair_dist))
+        if min_pair <= 2.0 * HOLE_RADIUS_MM:
+            raise ValueError(
+                f"{variant_name}: bottom holes overlap or touch; "
+                f"minimum center spacing={min_pair:.3f} mm"
+            )
+
+    hole_geometries = []
+    deepest_z = HOLE_DEPTH_MM + HOLE_RADIUS_MM
+
+    for hole_index, hole_center_xy in enumerate(hole_centers_xy):
+        hole_xy = hole_center_xy + np.column_stack([
+            HOLE_RADIUS_MM * ct,
+            HOLE_RADIUS_MM * st,
+        ])
+        hole_bottom_loop = np.column_stack([hole_xy, np.zeros(SEGMENTS)])
+        hole_end_loop = np.column_stack([
+            hole_xy,
+            np.full(SEGMENTS, HOLE_DEPTH_MM),
+        ])
+
+        hemisphere_rings = []
+        for k in range(1, HOLE_HEMISPHERE_SEGMENTS):
+            alpha = (np.pi / 2.0) * k / HOLE_HEMISPHERE_SEGMENTS
+            ring_r = HOLE_RADIUS_MM * np.cos(alpha)
+            ring_z = HOLE_DEPTH_MM + HOLE_RADIUS_MM * np.sin(alpha)
+            ring_xy = hole_center_xy + np.column_stack([
+                ring_r * ct,
+                ring_r * st,
+            ])
+            hemisphere_rings.append(
+                np.column_stack([ring_xy, np.full(SEGMENTS, ring_z)])
+            )
+
+        hemisphere_tip = np.array([[
+            hole_center_xy[0],
+            hole_center_xy[1],
+            deepest_z,
+        ]], dtype=np.float64)
+
+        # Make sure the cavity cannot break through the terrain surface.
+        check_xy = np.vstack([hole_xy, hole_center_xy.reshape(1, 2)])
+        local_top_z = interpolate_border_height(check_xy)
+        if deepest_z >= float(np.min(local_top_z)):
+            raise ValueError(
+                f"{variant_name}: bottom hole {hole_index + 1} "
+                "(including hemispherical end) is too deep and would break "
+                "through the terrain surface."
+            )
+
+        hole_geometries.append({
+            "center": hole_center_xy,
+            "bottom_loop": hole_bottom_loop,
+            "end_loop": hole_end_loop,
+            "hemisphere_rings": hemisphere_rings,
+            "tip": hemisphere_tip,
+        })
 
     parts = [cap_vertices]
+
     top_bevel_offsets = []
     for ring in top_bevel_rings:
         top_bevel_offsets.append(sum(len(x) for x in parts))
@@ -631,8 +851,23 @@ def build_inner_model(shell):
 
     bottom_offset = sum(len(x) for x in parts)
     parts.append(bottom_loop)
-    center_id = sum(len(x) for x in parts)
-    parts.append(bottom_center)
+
+    # Append each hole's opening loop, cylindrical end loop, hemispherical
+    # latitude rings, and final tip. Keep their offsets for face generation.
+    for hole in hole_geometries:
+        hole["bottom_offset"] = sum(len(x) for x in parts)
+        parts.append(hole["bottom_loop"])
+        hole["end_offset"] = sum(len(x) for x in parts)
+        parts.append(hole["end_loop"])
+
+        hemisphere_offsets = []
+        for ring in hole["hemisphere_rings"]:
+            hemisphere_offsets.append(sum(len(x) for x in parts))
+            parts.append(ring)
+        hole["hemisphere_offsets"] = hemisphere_offsets
+
+        hole["tip_id"] = sum(len(x) for x in parts)
+        parts.append(hole["tip"])
 
     all_vertices = np.vstack(parts)
     face_parts = [np.asarray(top_faces, dtype=np.int64)]
@@ -655,7 +890,87 @@ def build_inner_model(shell):
     if bevel_offsets:
         face_parts.append(connect_loop_faces(bevel_offsets[-1], bottom_offset))
 
-    face_parts.append(bottom_fan_faces(center_id, bottom_offset))
+    # ------------------------------------------------------------
+    # TRIANGULATE THE FLAT BOTTOM WITH 1 OR MORE CIRCULAR HOLES
+    # ------------------------------------------------------------
+    # The old one-hole version could connect the outer loop directly to one
+    # inner loop. With two independent holes that construction would overlap.
+    # Shapely 2.1 constrained Delaunay triangulation respects the outer circle
+    # and every circular hole boundary exactly, giving one clean planar face.
+    outer_xy = bottom_loop[:, :2]
+    hole_xy_rings = [h["bottom_loop"][:, :2] for h in hole_geometries]
+    bottom_polygon = Polygon(outer_xy, holes=[ring for ring in hole_xy_rings])
+    if (not bottom_polygon.is_valid) or bottom_polygon.is_empty:
+        raise RuntimeError(f"{variant_name}: invalid bottom polygon with holes")
+
+    bottom_triangles = shapely.constrained_delaunay_triangles(bottom_polygon)
+
+    # Coordinate -> mesh vertex id. Constrained triangulation uses the supplied
+    # boundary vertices; rounding only protects against tiny floating-point
+    # representation differences when coordinates come back from GEOS.
+    xy_to_vertex = {}
+    for j, xy in enumerate(outer_xy):
+        xy_to_vertex[(round(float(xy[0]), 10), round(float(xy[1]), 10))] = bottom_offset + j
+    for hole in hole_geometries:
+        off = hole["bottom_offset"]
+        for j, xy in enumerate(hole["bottom_loop"][:, :2]):
+            xy_to_vertex[(round(float(xy[0]), 10), round(float(xy[1]), 10))] = off + j
+
+    bottom_faces = []
+    for tri_geom in bottom_triangles.geoms:
+        coords = np.asarray(tri_geom.exterior.coords, dtype=np.float64)[:3, :2]
+        ids = []
+        for xy in coords:
+            key = (round(float(xy[0]), 10), round(float(xy[1]), 10))
+            if key not in xy_to_vertex:
+                raise RuntimeError(
+                    f"{variant_name}: bottom triangulation introduced an unexpected vertex {xy}"
+                )
+            ids.append(xy_to_vertex[key])
+
+        # Bottom outward normal must point toward -Z. A positive signed XY area
+        # is +Z, so reverse such triangles.
+        p0, p1, p2 = coords
+        signed2 = (
+            (p1[0] - p0[0]) * (p2[1] - p0[1])
+            - (p1[1] - p0[1]) * (p2[0] - p0[0])
+        )
+        if signed2 > 0:
+            ids = [ids[0], ids[2], ids[1]]
+        bottom_faces.append(ids)
+
+    face_parts.append(np.asarray(bottom_faces, dtype=np.int64))
+
+    # Add the cylindrical wall + hemispherical termination for every hole.
+    for hole in hole_geometries:
+        face_parts.append(
+            connect_loop_faces(
+                hole["bottom_offset"],
+                hole["end_offset"],
+                reverse=True,
+            )
+        )
+
+        previous_offset = hole["end_offset"]
+        for current_offset in hole["hemisphere_offsets"]:
+            face_parts.append(
+                connect_loop_faces(previous_offset, current_offset, reverse=True)
+            )
+            previous_offset = current_offset
+
+        last_ring_offset = (
+            hole["hemisphere_offsets"][-1]
+            if hole["hemisphere_offsets"]
+            else hole["end_offset"]
+        )
+        i = np.arange(SEGMENTS, dtype=np.int64)
+        n = (i + 1) % SEGMENTS
+        face_parts.append(np.column_stack([
+            last_ring_offset + i,
+            np.full(SEGMENTS, hole["tip_id"], dtype=np.int64),
+            last_ring_offset + n,
+        ]))
+
     all_faces = np.vstack(face_parts)
 
     mesh = trimesh.Trimesh(
@@ -664,7 +979,7 @@ def build_inner_model(shell):
         process=False,
     )
 
-    print("Cleaning inner mesh...")
+    print(f"Cleaning {variant_name} mesh...")
     mesh.update_faces(mesh.unique_faces())
     mesh.remove_unreferenced_vertices()
     mesh.merge_vertices()
@@ -878,16 +1193,256 @@ def build_annulus_model(shell):
 
 
 # ============================================================
-# BUILD BOTH FROM THE SAME TIFF / COMMON TERRAIN
+# OUTPUT 3: OUTER ANNULUS 2 - NO BOTTOM INNER BEVEL
 # ============================================================
 
-print("\n\n>>> BUILDING INNER MODEL")
-_t_inner = time.perf_counter()
+def build_annulus2_model(shell):
+    OUTER_RADIUS_MM = ANNULUS2_OUTER_DIAMETER_MM / 2.0
+    INNER_RADIUS_MM = ANNULUS2_INNER_DIAMETER_MM / 2.0
+    BEVEL_MM = ANNULUS2_OUTER_BOTTOM_BEVEL_MM
+    BEVEL_SEGMENTS = ANNULUS2_OUTER_BOTTOM_BEVEL_SEGMENTS
+    TOP_BEVEL_MM = ANNULUS2_TOP_BEVEL_MM
+    TOP_BEVEL_SEGMENTS = ANNULUS2_TOP_BEVEL_SEGMENTS
+
+    if INNER_RADIUS_MM <= 0:
+        raise ValueError("ANNULUS2_INNER_DIAMETER_MM must be > 0")
+    if INNER_RADIUS_MM >= OUTER_RADIUS_MM:
+        raise ValueError("Annulus 2 inner diameter must be smaller than outer diameter")
+    if BEVEL_MM < 0 or TOP_BEVEL_MM < 0:
+        raise ValueError("Annulus 2 bevels must be >= 0")
+    if BEVEL_SEGMENTS < 1 or TOP_BEVEL_SEGMENTS < 1:
+        raise ValueError("Annulus 2 bevel segment counts must be >= 1")
+    if INNER_RADIUS_MM >= OUTER_RADIUS_MM - BEVEL_MM:
+        raise ValueError("ANNULUS2_OUTER_BOTTOM_BEVEL_MM is too large for annulus width")
+    if INNER_RADIUS_MM + TOP_BEVEL_MM >= OUTER_RADIUS_MM - TOP_BEVEL_MM:
+        raise ValueError("ANNULUS2_TOP_BEVEL_MM is too large for annulus width")
+
+    theta = np.linspace(0.0, 2.0 * np.pi, SEGMENTS, endpoint=False)
+    ct, st = np.cos(theta), np.sin(theta)
+
+    # OUTER ANNULUS uses only the annulus-smoothed terrain/interpolator.
+    z_shift = shell.vertices[:, 2].max() - _ANNULUS2_BASE_MAX_Z
+
+    def interpolate_border_height(points_xy):
+        return interpolate_annulus2_terrain_height(points_xy, z_shift=z_shift)
+
+    top_outer_radius = OUTER_RADIUS_MM - TOP_BEVEL_MM
+    top_inner_radius = INNER_RADIUS_MM + TOP_BEVEL_MM
+
+    top_outer_xy = np.column_stack([top_outer_radius * ct, top_outer_radius * st])
+    top_inner_xy = np.column_stack([top_inner_radius * ct, top_inner_radius * st])
+    top_outer_z = interpolate_border_height(top_outer_xy)
+    top_inner_z = interpolate_border_height(top_inner_xy)
+    top_outer_loop = np.column_stack([top_outer_xy, top_outer_z])
+    top_inner_loop = np.column_stack([top_inner_xy, top_inner_z])
+
+    r = np.linalg.norm(shell.vertices[:, :2], axis=1)
+    terrain_points = shell.vertices[(r >= top_inner_radius) & (r <= top_outer_radius)]
+
+    if len(terrain_points) > 0:
+        points_xy = terrain_points[:, :2]
+        outer_dist, _ = cKDTree(top_outer_xy).query(points_xy, k=1)
+        inner_dist, _ = cKDTree(top_inner_xy).query(points_xy, k=1)
+        terrain_points = terrain_points[(outer_dist > 1e-6) & (inner_dist > 1e-6)]
+
+    cap_vertices = np.vstack([terrain_points, top_outer_loop, top_inner_loop])
+    top_outer_boundary_offset = len(terrain_points)
+    top_inner_boundary_offset = top_outer_boundary_offset + SEGMENTS
+
+    tri = Delaunay(cap_vertices[:, :2])
+    top_faces = tri.simplices
+    centers = np.mean(cap_vertices[top_faces][:, :, :2], axis=1)
+    center_r = np.linalg.norm(centers, axis=1)
+    top_faces = top_faces[(center_r <= top_outer_radius) & (center_r >= top_inner_radius)]
+
+    top_outer_bevel_rings = []
+    if TOP_BEVEL_MM > 0:
+        for k in range(1, TOP_BEVEL_SEGMENTS + 1):
+            phi = (np.pi / 2.0) * k / TOP_BEVEL_SEGMENTS
+            ring_r = OUTER_RADIUS_MM - TOP_BEVEL_MM + TOP_BEVEL_MM * np.sin(phi)
+            ring_xy = np.column_stack([ring_r * ct, ring_r * st])
+            terrain_ring_z = interpolate_border_height(ring_xy)
+            bevel_drop = TOP_BEVEL_MM * (1.0 - np.cos(phi))
+            top_outer_bevel_rings.append(
+                np.column_stack([ring_xy, terrain_ring_z - bevel_drop])
+            )
+
+    top_inner_bevel_rings = []
+    if TOP_BEVEL_MM > 0:
+        for k in range(1, TOP_BEVEL_SEGMENTS + 1):
+            phi = (np.pi / 2.0) * k / TOP_BEVEL_SEGMENTS
+            ring_r = INNER_RADIUS_MM + TOP_BEVEL_MM - TOP_BEVEL_MM * np.sin(phi)
+            ring_xy = np.column_stack([ring_r * ct, ring_r * st])
+            terrain_ring_z = interpolate_border_height(ring_xy)
+            bevel_drop = TOP_BEVEL_MM * (1.0 - np.cos(phi))
+            top_inner_bevel_rings.append(
+                np.column_stack([ring_xy, terrain_ring_z - bevel_drop])
+            )
+
+    bottom_outer_bevel_rings = []
+    if BEVEL_MM > 0:
+        for k in range(BEVEL_SEGMENTS):
+            phi = (np.pi / 2.0) * k / BEVEL_SEGMENTS
+            ring_r = OUTER_RADIUS_MM - BEVEL_MM + BEVEL_MM * np.cos(phi)
+            ring_z = BEVEL_MM - BEVEL_MM * np.sin(phi)
+            bottom_outer_bevel_rings.append(np.column_stack([
+                ring_r * ct,
+                ring_r * st,
+                np.full(SEGMENTS, ring_z),
+            ]))
+
+    # ANNULUS 2: intentionally NO bottom inner bevel.
+    # The inner cylindrical wall continues straight down to Z=0 at INNER_RADIUS_MM.
+    bottom_inner_bevel_rings = []
+
+    bottom_outer_radius = OUTER_RADIUS_MM - BEVEL_MM
+    bottom_inner_radius = INNER_RADIUS_MM
+    bottom_outer_loop = np.column_stack([
+        bottom_outer_radius * ct,
+        bottom_outer_radius * st,
+        np.zeros(SEGMENTS),
+    ])
+    bottom_inner_loop = np.column_stack([
+        bottom_inner_radius * ct,
+        bottom_inner_radius * st,
+        np.zeros(SEGMENTS),
+    ])
+
+    parts = [cap_vertices]
+
+    def append_rings(rings):
+        offsets = []
+        for ring in rings:
+            offsets.append(sum(len(x) for x in parts))
+            parts.append(ring)
+        return offsets
+
+    top_outer_bevel_offsets = append_rings(top_outer_bevel_rings)
+    top_inner_bevel_offsets = append_rings(top_inner_bevel_rings)
+    bottom_outer_bevel_offsets = append_rings(bottom_outer_bevel_rings)
+    bottom_inner_bevel_offsets = append_rings(bottom_inner_bevel_rings)
+
+    bottom_outer_offset = sum(len(x) for x in parts)
+    parts.append(bottom_outer_loop)
+    bottom_inner_offset = sum(len(x) for x in parts)
+    parts.append(bottom_inner_loop)
+
+    all_vertices = np.vstack(parts)
+    face_parts = [np.asarray(top_faces, dtype=np.int64)]
+
+    previous_offset = top_outer_boundary_offset
+    for current_offset in top_outer_bevel_offsets:
+        face_parts.append(connect_loop_faces(previous_offset, current_offset, reverse=False))
+        previous_offset = current_offset
+    outer_wall_top_offset = previous_offset
+
+    previous_offset = top_inner_boundary_offset
+    for current_offset in top_inner_bevel_offsets:
+        face_parts.append(connect_loop_faces(previous_offset, current_offset, reverse=True))
+        previous_offset = current_offset
+    inner_wall_top_offset = previous_offset
+
+    outer_wall_bottom_offset = (
+        bottom_outer_bevel_offsets[0]
+        if bottom_outer_bevel_offsets else bottom_outer_offset
+    )
+    inner_wall_bottom_offset = (
+        bottom_inner_bevel_offsets[0]
+        if bottom_inner_bevel_offsets else bottom_inner_offset
+    )
+
+    face_parts.append(connect_loop_faces(outer_wall_top_offset, outer_wall_bottom_offset, reverse=False))
+    face_parts.append(connect_loop_faces(inner_wall_top_offset, inner_wall_bottom_offset, reverse=True))
+
+    for a_off, b_off in zip(bottom_outer_bevel_offsets[:-1], bottom_outer_bevel_offsets[1:]):
+        face_parts.append(connect_loop_faces(a_off, b_off, reverse=False))
+    if bottom_outer_bevel_offsets:
+        face_parts.append(connect_loop_faces(bottom_outer_bevel_offsets[-1], bottom_outer_offset, reverse=False))
+
+    for a_off, b_off in zip(bottom_inner_bevel_offsets[:-1], bottom_inner_bevel_offsets[1:]):
+        face_parts.append(connect_loop_faces(a_off, b_off, reverse=True))
+    if bottom_inner_bevel_offsets:
+        face_parts.append(connect_loop_faces(bottom_inner_bevel_offsets[-1], bottom_inner_offset, reverse=True))
+
+    face_parts.append(connect_loop_faces(bottom_outer_offset, bottom_inner_offset, reverse=True))
+    all_faces = np.vstack(face_parts)
+
+    mesh = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=all_faces,
+        process=False,
+    )
+
+    print("Cleaning annulus 2 mesh...")
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+    mesh.merge_vertices()
+    mesh.merge_vertices(digits_vertex=6)
+    repair.fill_holes(mesh)
+    mesh.fix_normals()
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+# ============================================================
+# BUILD TWO INNER VARIANTS + TWO OUTER ANNULI FROM THE SAME TIFF
+# ============================================================
+
 inner_terrain = terrain_at_top_height(terrain_base, INNER_TOP_HEIGHT_MM)
 print("Inner terrain Z:", inner_terrain.vertices[:, 2].min(), inner_terrain.vertices[:, 2].max())
-inner_mesh = build_inner_model(inner_terrain)
-validate_mesh(inner_mesh, "INNER MODEL VALIDATION")
-print(f"Inner build time: {(time.perf_counter()-_t_inner)/60:.2f} min")
+
+# Variant A: original requested hole exactly SOUTH, 84 mm from center.
+south_hole_centers = np.array([
+    [0.0, -INNER_BOTTOM_HOLE_CENTER_DISTANCE_MM],
+], dtype=np.float64)
+
+print(f"\n\n>>> BUILDING INNER A: SOUTH HOLE (base diameter {INNER_BASE_DIAMETER_MM:.3f} mm)")
+_t_inner_south = time.perf_counter()
+inner_south_mesh = build_inner_model(
+    inner_terrain,
+    south_hole_centers,
+    INNER_BASE_DIAMETER_MM,
+    variant_name="INNER SOUTH",
+)
+validate_mesh(inner_south_mesh, "INNER SOUTH MODEL VALIDATION")
+print(
+    "INNER SOUTH hemispherical-ended hole: "
+    f"diameter={INNER_BOTTOM_HOLE_DIAMETER_MM:.3f} mm, "
+    f"center=(0.000, {-INNER_BOTTOM_HOLE_CENTER_DISTANCE_MM:.3f}) mm, "
+    f"straight_depth={INNER_BOTTOM_HOLE_DEPTH_MM:.3f} mm, "
+    f"total_depth={INNER_BOTTOM_HOLE_DEPTH_MM + INNER_BOTTOM_HOLE_DIAMETER_MM / 2.0:.3f} mm"
+)
+print(f"Inner SOUTH build time: {(time.perf_counter()-_t_inner_south)/60:.2f} min")
+
+# Variant B: three identical holes exactly EAST, WEST and SOUTH,
+# each at the same distance from the center.
+# +X = EAST, -X = WEST, -Y = SOUTH.
+east_west_south_hole_centers = np.array([
+    [+INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM, 0.0],  # EAST
+    [-INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM, 0.0],  # WEST
+    [0.0, -INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM],  # SOUTH
+], dtype=np.float64)
+
+print(f"\n\n>>> BUILDING INNER B: EAST + WEST + SOUTH HOLES (base diameter {INNER_BASE_DIAMETER2_MM:.3f} mm)")
+_t_inner_2 = time.perf_counter()
+inner_three_holes_mesh = build_inner_model(
+    inner_terrain,
+    east_west_south_hole_centers,
+    INNER_BASE_DIAMETER2_MM,
+    variant_name="INNER E+W+S",
+)
+validate_mesh(inner_three_holes_mesh, "INNER E+W+S MODEL VALIDATION")
+print(
+    "INNER EAST+WEST+SOUTH hemispherical-ended holes: "
+    f"diameter={INNER_BOTTOM_HOLE_DIAMETER_MM:.3f} mm each, "
+    f"centers=(+{INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM:.3f}, 0.000), "
+    f"(-{INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM:.3f}, 0.000), and "
+    f"(0.000, -{INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM:.3f}) mm, "
+    f"straight_depth={INNER_BOTTOM_HOLE_DEPTH_MM:.3f} mm, "
+    f"total_depth={INNER_BOTTOM_HOLE_DEPTH_MM + INNER_BOTTOM_HOLE_DIAMETER_MM / 2.0:.3f} mm"
+)
+print(f"Inner 3-hole build time: {(time.perf_counter()-_t_inner_2)/60:.2f} min")
 
 print("\n\n>>> BUILDING OUTER ANNULUS")
 _t_annulus = time.perf_counter()
@@ -897,25 +1452,48 @@ annulus_mesh = build_annulus_model(annulus_terrain)
 validate_mesh(annulus_mesh, "ANNULUS MODEL VALIDATION")
 print(f"Annulus build time: {(time.perf_counter()-_t_annulus)/60:.2f} min")
 
+print(
+    "\n\n>>> BUILDING OUTER ANNULUS 2 (NO BOTTOM INNER BEVEL) "
+    f"for INNER diameter {INNER_BASE_DIAMETER2_MM:.3f} mm "
+    f"-> annulus inner diameter {ANNULUS2_INNER_DIAMETER_MM:.3f} mm"
+)
+_t_annulus2 = time.perf_counter()
+annulus2_terrain = terrain_at_top_height(terrain_base_annulus2, ANNULUS2_TOP_HEIGHT_MM)
+print("Annulus 2 terrain Z:", annulus2_terrain.vertices[:, 2].min(), annulus2_terrain.vertices[:, 2].max())
+annulus2_mesh = build_annulus2_model(annulus2_terrain)
+validate_mesh(annulus2_mesh, "ANNULUS 2 NO-INNER-BOTTOM-BEVEL VALIDATION")
+print(f"Annulus 2 build time: {(time.perf_counter()-_t_annulus2)/60:.2f} min")
+
 # ============================================================
-# EXPORT + DOWNLOAD BOTH STL FILES
+# EXPORT + DOWNLOAD ALL FOUR STL FILES
 # ============================================================
 
-inner_output = "terrain_inner_closed_cylinder.stl"
+inner_south_output = "terrain_inner_south_hole.stl"
+inner_three_holes_output = "terrain_inner_east_west_south_holes.stl"
 annulus_output = "terrain_outer_annulus.stl"
+annulus2_output = "terrain_outer_annulus_no_bottom_inner_bevel.stl"
 
-inner_mesh.export(inner_output)
+inner_south_mesh.export(inner_south_output)
+inner_three_holes_mesh.export(inner_three_holes_output)
 annulus_mesh.export(annulus_output)
+annulus2_mesh.export(annulus2_output)
 
-print("\nSaved:", inner_output)
+print("\nSaved:", inner_south_output)
+print("Saved:", inner_three_holes_output)
 print("Saved:", annulus_output)
-print("\nDownloading both STL files...")
+print("Saved:", annulus2_output)
+print("\nDownloading all four STL files...")
 
-files.download(inner_output)
+files.download(inner_south_output)
+files.download(inner_three_holes_output)
 files.download(annulus_output)
+files.download(annulus2_output)
 
 print(f"\nTotal runtime: {(time.perf_counter()-_t_total)/60:.2f} min")
-print("DONE - one TIFF produced two STL files.")
+print(
+    "DONE - one TIFF produced two INNER base models with independent diameters "
+    "plus their corresponding OUTER annulus STL files."
+)
 
 # ============================================================
 # REAL-WORLD DISTANCE FOR 180 MM AT MODEL SCALE
