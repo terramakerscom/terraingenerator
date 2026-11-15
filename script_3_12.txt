@@ -1,13 +1,33 @@
 # ============================================================
-# TouchTerrain -> INNER MODEL + OUTER ANNULUS
+# TouchTerrain -> TWO PRINT-READY STL ASSEMBLIES (GENERATED ANNULUS + N + ZIP STL)
 # Combined script by Jan Mestan
 # Optimized version: vectorized loop-face generation; geometry/parameters preserved
 # Based on inner v3.10 and annulus v3.11 scripts
 # ============================================================
 
-!pip install rasterio pyproj numpy scipy trimesh pillow affine "shapely>=2.1" --quiet
+!pip install rasterio pyproj numpy scipy trimesh pillow affine "shapely>=2.1" matplotlib mapbox_earcut --quiet
+
+# Robust Manifold3D bootstrap for Colab/Jupyter.
+# Use the exact Python interpreter backing the current notebook kernel.
+import sys
+import subprocess
+import importlib
+
+try:
+    import manifold3d
+except ModuleNotFoundError:
+    print("manifold3d is missing; installing it into the active notebook kernel...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "--upgrade", "--no-cache-dir", "manifold3d>=3.4.0"
+    ])
+    importlib.invalidate_caches()
+    import manifold3d
+
+print("manifold3d ready:", getattr(manifold3d, "__version__", "installed"))
 
 import time
+
 import numpy as np
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
@@ -19,7 +39,11 @@ from scipy.spatial import Delaunay, cKDTree
 import trimesh
 import trimesh.repair as repair
 import shapely
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, LineString, Point
+from shapely.affinity import scale as shapely_scale, translate as shapely_translate
+from shapely.ops import polygonize
+from matplotlib.textpath import TextPath
+from matplotlib.font_manager import FontProperties
 from google.colab import files
 
 # ============================================================
@@ -34,7 +58,7 @@ UPSCALE = 2
 # INNER MODEL
 INNER_TOP_HEIGHT_MM = 50.0
 INNER_BASE_DIAMETER_MM = 180.0
-# NEW: base diameter used by the INNER model with EAST + WEST + SOUTH holes.
+# NEW: base diameter used by the second INNER model with EAST + WEST holes plus one NORTH hole.
 # Set this to the desired second base diameter.
 INNER_BASE_DIAMETER2_MM = 190.0
 INNER_BEVEL_MM = 2.4
@@ -42,15 +66,61 @@ INNER_BEVEL_SEGMENTS = 20
 INNER_TOP_BEVEL_MM = 2.4
 INNER_TOP_BEVEL_SEGMENTS = 20
 
-# INNER BOTTOM BLIND HOLE WITH HEMISPHERICAL END
+# INNER BOTTOM BLIND HOLE WITH SELF-SUPPORTING 45-DEGREE CONICAL END
 # Final orientation is +X=EAST, +Y=NORTH, so SOUTH is -Y.
 INNER_BOTTOM_HOLE_DIAMETER_MM = 4.0
 INNER_BOTTOM_HOLE_CENTER_DISTANCE_MM = 84.0
 INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM = 89.0
-# Straight cylindrical part before the hemispherical end begins.
-INNER_BOTTOM_HOLE_DEPTH_MM = 2.56
-# Number of latitude rings used for the hemisphere (higher = smoother).
-INNER_BOTTOM_HOLE_HEMISPHERE_SEGMENTS = 24
+# Straight cylindrical depth before the 45-degree conical roof begins.
+# Deepest point is this value + hole radius.
+INNER_BOTTOM_HOLE_DEPTH_MM = 5.00
+
+# EAST + WEST UNDERCUT KEYHOLE / BAYONET LOCKS
+# Applied ONLY to INNER A. There is NO SOUTH bayonet on INNER A.
+#
+# Locking direction: when viewed from TOP (+Z looking toward the model),
+# the MODEL locks by rotating COUNTER-CLOCKWISE.  Therefore the entry point
+# of each bayonet is placed at a positive angular offset from its stop pocket.
+# The EAST and WEST locks are related by a 180-degree rotation, not a mirror.
+#
+# Geometry of each lock:
+#   * one full-size ENTRY hole for the pin head,
+#   * a wide HIDDEN curved channel for the head,
+#   * a thin curved slot through the retained bottom lip for the pin stem,
+#   * a hidden rounded stop pocket at exact EAST or WEST.
+#
+# Keep the numerical values below as in the user-supplied latest script.
+EW_BAYONET_HEAD_DIAMETER_MM = INNER_BOTTOM_HOLE_DIAMETER_MM + 3.0
+EW_BAYONET_CENTER_DISTANCE_MM = INNER_BOTTOM_HOLE_CENTER_DISTANCE_MM - 3.0
+EW_BAYONET_ROTATION_DEG = 6.0
+
+# Open slot width for the pin leg/stem. Set to stem diameter + print clearance.
+EW_BAYONET_STEM_SLOT_WIDTH_MM = 4.2
+
+# Material thickness retained between bottom surface Z=0 and the hidden head channel.
+EW_BAYONET_LIP_THICKNESS_MM = 1.35
+
+# Vertical head clearance above the bottom.
+EW_BAYONET_HEAD_CLEARANCE_DEPTH_MM = (
+    4.0
+)
+
+EW_BAYONET_ARC_SAMPLES = 48
+
+# NORTH UNDERCUT KEYHOLE / BAYONET LOCK
+# Same locking orientation as EAST/WEST: MODEL locks COUNTER-CLOCKWISE viewed from TOP.
+# The final locked stop pocket is exactly NORTH at 70 mm from model center.
+NORTH_BAYONET_CENTER_DISTANCE_MM = 70.0
+NORTH_BAYONET_ROTATION_DEG = EW_BAYONET_ROTATION_DEG
+NORTH_BAYONET_HEAD_DIAMETER_MM = EW_BAYONET_HEAD_DIAMETER_MM
+NORTH_BAYONET_STEM_SLOT_WIDTH_MM = EW_BAYONET_STEM_SLOT_WIDTH_MM
+NORTH_BAYONET_LIP_THICKNESS_MM = EW_BAYONET_LIP_THICKNESS_MM
+NORTH_BAYONET_HEAD_CLEARANCE_DEPTH_MM = EW_BAYONET_HEAD_CLEARANCE_DEPTH_MM
+NORTH_BAYONET_ARC_SAMPLES = EW_BAYONET_ARC_SAMPLES
+
+# Additional conventional NORTH self-supporting blind hole (same style as WEST/EAST holes).
+NORTH_EXTRA_HOLE_DIAMETER_MM = 7.0
+NORTH_EXTRA_HOLE_CENTER_DISTANCE_MM = 81.5
 
 # OUTER ANNULUS
 # This annulus belongs to INNER_BASE_DIAMETER_MM.
@@ -84,6 +154,92 @@ ANNULUS2_SMOOTH_SIGMA = 2.0  # Gaussian smoothing ONLY for annulus 2; 0 = off
 # Angular resolution used by both output meshes
 SEGMENTS = 512
 
+# ============================================================
+# BOTTOM ENGRAVING: ONLY NORTH MARKER N
+# ============================================================
+# Applied ONLY to the two INNER models, from the flat underside (Z=0) inward.
+BOTTOM_ENGRAVING_ENABLED = True
+BOTTOM_ENGRAVING_DEPTH_MM = 5.0
+BOTTOM_ENGRAVING_EPS_MM = 0.08
+
+# Separate press-in logo/text STL. The insert is 4.8 mm tall and its XY outline
+# is reduced by 0.30 mm overall (0.15 mm clearance on each opposing side).
+BOTTOM_INSERT_HEIGHT_MM = 4.8
+BOTTOM_INSERT_TOTAL_XY_REDUCTION_MM = 0.30
+# In the separate insert STL only, arrange logo/text parts compactly with this
+# edge-to-edge vertical gap. The engraving positions in the INNER models are unchanged.
+BOTTOM_INSERT_LAYOUT_GAP_MM = 5.0
+
+# Artwork scaling. Logo and every text element are 1.3x larger than v2.
+BOTTOM_ARTWORK_SCALE = 1.3
+BOTTOM_LOGO_XY_SCALE = 1.0
+BOTTOM_TEXT_XY_SCALE = 1.0
+
+# Keep the main logo/text stack centered horizontally on the model.
+BOTTOM_ENGRAVING_CENTER_X_MM = 0.0
+BOTTOM_ENGRAVING_CENTER_Y_MM = 0.0
+
+# Curved PLA line following the lower circular edge of the flat underside.
+BOTTOM_PLA_CURVED = True
+BOTTOM_PLA_ARC_CENTER_ANGLE_DEG = -90.0
+# Radial clearance from the flat-bottom circle to the OUTER edge of the curved PLA text.
+BOTTOM_PLA_OUTER_MARGIN_MM = 4.5
+# Legacy curved-text width parameter kept for compatibility; the curved material line
+# now preserves its true 1.9x text height and is NOT shrunk to this width.
+BOTTOM_PLA_MAX_WIDTH_MM = 40.0
+
+# Optional north marker engraved into BOTH INNER models, placed below the NORTH hole.
+BOTTOM_NORTH_MARKER_TEXT = "N"
+BOTTOM_NORTH_MARKER_GAP_MM = 3.5
+# Move the N cavity on BOTH INNER models 10 mm radially toward (0, 0).
+# Since the N is already on X=0, this is a -Y translation.
+BOTTOM_NORTH_MARKER_INWARD_SHIFT_MM = 10.0
+
+# UNDERSIDE LOGO/TEXT CAVITIES
+# Logo and text are cut straight inward from Z=0 to Z=5 mm and end with a
+# completely flat horizontal ceiling. No 45-degree self-supporting roof is used.
+
+# Bayonet hidden head channels keep their full clearance up to head_depth, then
+# close with a 45-degree roof to a very thin ridge.
+BAYONET_ROOF_STEP_MM = 0.20
+BAYONET_ROOF_FINAL_HALF_WIDTH_MM = 0.10
+
+# Logo reduced to 0.8x of the previous 117 mm size: final width = 93.6 mm.
+BOTTOM_LOGO_REFERENCE_WIDTH_MM = 72.0
+BOTTOM_LOGO_WIDTH_MM = BOTTOM_LOGO_REFERENCE_WIDTH_MM * BOTTOM_ARTWORK_SCALE
+# Keep the logo itself centered on the model.
+BOTTOM_LOGO_CENTER_X_MM = 0.0
+# Shift the whole underside engraving block a little higher, closer to the model center.
+BOTTOM_LOGO_CENTER_Y_MM = 34.0
+
+# Optional custom text engraved directly below the logo.
+# Put anything you want between the quotes. Leave it empty ("") to omit this line.
+BOTTOM_CUSTOM_TEXT = ""  # removed
+
+# Text appearance and requested vertical layout below the logo.
+# "by Jan Mestan" is fitted to exactly 50 mm width. Its resulting font size
+# is then reused for AUSTRALIA, scale, VE and the curved material text.
+BOTTOM_TEXT_HEIGHT_MM = 5.0  # fallback/default for generic helper calls
+BOTTOM_TEXT_MAX_WIDTH_MM = 82.0  # fallback/default for generic helper calls
+BOTTOM_SIGNATURE_TEXT = ""  # removed from engraving; sizing reference is kept separately below
+BOTTOM_SIGNATURE_WIDTH_MM = 50.0 * BOTTOM_ARTWORK_SCALE  # legacy 65 mm text-size reference
+BOTTOM_TEXT_SIZE_REFERENCE = "by Jan Mestan"
+BOTTOM_TEXT_SIZE_REFERENCE_WIDTH_MM = BOTTOM_SIGNATURE_WIDTH_MM
+BOTTOM_LOGO_TO_SIGNATURE_GAP_MM = 8.0
+BOTTOM_SIGNATURE_TO_CUSTOM_GAP_MM = 12.0
+BOTTOM_CUSTOM_TO_SCALE_GAP_MM = 6.0
+BOTTOM_SCALE_TO_VE_GAP_MM = 5.0
+BOTTOM_NORTH_MARKER_SCALE = 0.8
+BOTTOM_MATERIAL_TEXT = "TERRAMAKERS.COM"
+BOTTOM_CURVED_TEXT_SCALE = 0.8
+BOTTOM_TEXT_FONT_FAMILY = "DejaVu Sans"
+BOTTOM_TEXT_BOLD = True
+
+# A design placed in XY and viewed from +Z appears horizontally mirrored when
+# the finished part is viewed from its underside (-Z looking toward +Z).
+# Keep this True so logo and text read normally on the physical bottom face.
+BOTTOM_MIRROR_X_FOR_UNDERSIDE = True
+
 # Validate the two-diameter setup early.
 if INNER_BASE_DIAMETER_MM <= 0 or INNER_BASE_DIAMETER2_MM <= 0:
     raise ValueError("Both INNER base diameters must be > 0")
@@ -94,17 +250,91 @@ if np.isclose(INNER_BASE_DIAMETER_MM, INNER_BASE_DIAMETER2_MM):
     )
 
 # ============================================================
-# UPLOAD TIFF ONCE
+# INPUT: UPLOAD ONE ZIP WITH BOTH TARGET STL FILES, THEN ONE TIFF
 # ============================================================
 
 _t_total = time.perf_counter()
-print("Upload ONE TouchTerrain TIFF")
-uploaded = files.upload()
-if not uploaded:
-    raise RuntimeError("No TIFF uploaded.")
 
-tif_file = list(uploaded.keys())[0]
-print("Loaded:", tif_file)
+# The ZIP must contain smaller.stl and bigger.stl (case insensitive).
+# These are only the TARGET models; both ANNULUS meshes are generated from TIFF.
+import io
+import zipfile
+from pathlib import PurePosixPath, Path
+
+print("\nUpload ONE ZIP containing smaller.stl and bigger.stl")
+zip_upload = files.upload()
+if len(zip_upload) != 1:
+    raise RuntimeError("Upload exactly ONE ZIP file containing both STL models.")
+zip_name, zip_bytes = next(iter(zip_upload.items()))
+if not zip_name.lower().endswith(".zip"):
+    raise ValueError(f"Expected a .zip file, received: {zip_name}")
+
+annulus1_target_stl = "target_smaller.stl"
+annulus2_target_stl = "target_bigger.stl"
+
+with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as archive:
+    # Match file basenames, allowing a single subfolder inside the ZIP.
+    candidates = {"smaller.stl": [], "bigger.stl": []}
+    for entry in archive.infolist():
+        if entry.is_dir():
+            continue
+        basename = PurePosixPath(entry.filename.replace("\\", "/")).name.lower()
+        if basename in candidates:
+            candidates[basename].append(entry)
+
+    for expected_name, output_path in (
+        ("smaller.stl", annulus1_target_stl),
+        ("bigger.stl", annulus2_target_stl),
+    ):
+        matches = candidates[expected_name]
+        if len(matches) != 1:
+            raise ValueError(
+                f"ZIP must contain exactly one {expected_name}; found {len(matches)}."
+            )
+        info = matches[0]
+        if info.file_size > 300 * 1024 * 1024:
+            raise ValueError(f"{expected_name} exceeds the 300 MB per-file safety limit")
+        with archive.open(info) as source, open(output_path, "wb") as target:
+            total = 0
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 300 * 1024 * 1024:
+                    raise ValueError(f"{expected_name} is too large")
+                target.write(chunk)
+
+        if Path(output_path).stat().st_size < 84:
+            raise ValueError(f"{expected_name} is too small to be a valid STL")
+        try:
+            test_mesh = trimesh.load(output_path, file_type="stl", force="mesh", process=False)
+            if (not isinstance(test_mesh, trimesh.Trimesh)
+                    or len(test_mesh.faces) == 0
+                    or not np.all(np.isfinite(test_mesh.vertices))):
+                raise ValueError("STL has no valid triangle geometry")
+        except Exception as exc:
+            raise RuntimeError(f"Invalid STL in ZIP: {expected_name}") from exc
+        print(f"Loaded {expected_name}: {total:,} bytes, {len(test_mesh.faces):,} triangles")
+
+print("\nUpload ONE georeferenced TouchTerrain TIFF (.tif or .tiff)")
+incoming_tif = files.upload()
+if len(incoming_tif) != 1:
+    raise RuntimeError("Upload exactly one TIFF file.")
+tif_file = next(iter(incoming_tif))
+if not tif_file.lower().endswith((".tif", ".tiff")):
+    raise ValueError(f"Expected a TIFF file; got {tif_file}")
+print("Loaded TIFF:", tif_file)
+
+# Placement parameters, in millimeters.
+# The target STL is translated so its XY bounding-box center is at (0,0) and
+# its lowest vertex touches the print bed at Z=0. It is NOT rotated or scaled.
+CENTER_TARGET_STL_ON_XY = True
+PLACE_TARGET_STL_ON_BED = True
+ANNULUS1_ROTATION_DEG = 90.0
+ANNULUS1_EXTRA_X_OFFSET_MM = 7.197  # Additional +X shift for rotated smaller annulus ONLY
+N_PRINT_CENTER_X_MM = 0.0
+N_PRINT_CENTER_Y_MM = -50.0
 
 # ============================================================
 # COMMON TIFF PREPROCESSING - RUNS ONLY ONCE
@@ -172,7 +402,16 @@ def gaussian_filter_nan(data, sigma):
 
 
 reprojected_annulus = gaussian_filter_nan(reprojected, ANNULUS_SMOOTH_SIGMA)
-reprojected_annulus2 = gaussian_filter_nan(reprojected, ANNULUS2_SMOOTH_SIGMA)
+# If both annuli request the same smoothing, reuse the exact same raster instead of
+# running the expensive NaN-aware Gaussian filter a second time. Geometry is identical.
+_ANNULUS_TERRAINS_IDENTICAL = bool(
+    np.isclose(ANNULUS2_SMOOTH_SIGMA, ANNULUS_SMOOTH_SIGMA, rtol=0.0, atol=0.0)
+)
+if _ANNULUS_TERRAINS_IDENTICAL:
+    reprojected_annulus2 = reprojected_annulus
+    print("Annulus 2 smoothing raster: REUSED from annulus 1 (identical sigma)")
+else:
+    reprojected_annulus2 = gaussian_filter_nan(reprojected, ANNULUS2_SMOOTH_SIGMA)
 print("Annulus-only Gaussian sigma:", ANNULUS_SMOOTH_SIGMA)
 print("Annulus 2-only Gaussian sigma:", ANNULUS2_SMOOTH_SIGMA)
 
@@ -274,15 +513,18 @@ Y_annulus = annulus_radius * np.cos(lat_r) * np.sin(lon_r)
 Z_annulus = annulus_radius * np.sin(lat_r)
 vertices_annulus = np.column_stack([X_annulus, Y_annulus, Z_annulus])
 
-# Separate spherical terrain for OUTER ANNULUS 2, with its own smoothing.
-annulus2_terrain_height_m = elev_annulus2_valid * ZSCALE
-annulus2_terrain_height_mm = annulus2_terrain_height_m * 1000.0 / MAP_SCALE
-annulus2_radius = earth_radius_mm + annulus2_terrain_height_mm
-
-X_annulus2 = annulus2_radius * np.cos(lat_r) * np.cos(lon_r)
-Y_annulus2 = annulus2_radius * np.cos(lat_r) * np.sin(lon_r)
-Z_annulus2 = annulus2_radius * np.sin(lat_r)
-vertices_annulus2 = np.column_stack([X_annulus2, Y_annulus2, Z_annulus2])
+# Separate spherical terrain for OUTER ANNULUS 2. When the smoothing is identical,
+# this point cloud is mathematically and numerically identical, so alias it.
+if _ANNULUS_TERRAINS_IDENTICAL:
+    vertices_annulus2 = vertices_annulus
+else:
+    annulus2_terrain_height_m = elev_annulus2_valid * ZSCALE
+    annulus2_terrain_height_mm = annulus2_terrain_height_m * 1000.0 / MAP_SCALE
+    annulus2_radius = earth_radius_mm + annulus2_terrain_height_mm
+    X_annulus2 = annulus2_radius * np.cos(lat_r) * np.cos(lon_r)
+    Y_annulus2 = annulus2_radius * np.cos(lat_r) * np.sin(lon_r)
+    Z_annulus2 = annulus2_radius * np.sin(lat_r)
+    vertices_annulus2 = np.column_stack([X_annulus2, Y_annulus2, Z_annulus2])
 
 # True sphere scale info
 distances = np.linalg.norm(vertices, axis=1)
@@ -320,14 +562,21 @@ terrain_base_annulus = trimesh.Trimesh(
     faces=faces.copy(),
     process=False,
 )
-terrain_base_annulus2 = trimesh.Trimesh(
-    vertices=vertices_annulus2,
-    faces=faces.copy(),
-    process=False,
-)
+if _ANNULUS_TERRAINS_IDENTICAL:
+    # Delay the annulus-2 copy until after cleanup/ENU transform so those expensive
+    # operations are performed only once on the identical smoothed terrain.
+    terrain_base_annulus2 = None
+    _terrain_meshes_to_prepare = (terrain_base, terrain_base_annulus)
+else:
+    terrain_base_annulus2 = trimesh.Trimesh(
+        vertices=vertices_annulus2,
+        faces=faces.copy(),
+        process=False,
+    )
+    _terrain_meshes_to_prepare = (terrain_base, terrain_base_annulus, terrain_base_annulus2)
 
-# Clean all three terrain meshes independently while keeping their geometry aligned.
-for _mesh in (terrain_base, terrain_base_annulus, terrain_base_annulus2):
+# Clean only distinct terrain meshes.
+for _mesh in _terrain_meshes_to_prepare:
     _mesh.update_faces(_mesh.unique_faces())
     valid_faces = _mesh.area_faces > 1e-12
     _mesh.update_faces(valid_faces)
@@ -479,11 +728,11 @@ if pole_fallback_used:
 enu_matrix = np.eye(4, dtype=np.float64)
 enu_matrix[:3, :3] = R_ENU
 
-# Apply EXACTLY the same rigid rotation to original and smoothed terrain.
-assert "terrain_base_annulus2" in globals(), "ANNULUS2 mesh was not initialized before ENU transform"
+# Apply EXACTLY the same rigid rotation to each distinct terrain.
 terrain_base.apply_transform(enu_matrix)
 terrain_base_annulus.apply_transform(enu_matrix)
-terrain_base_annulus2.apply_transform(enu_matrix)
+if not _ANNULUS_TERRAINS_IDENTICAL:
+    terrain_base_annulus2.apply_transform(enu_matrix)
 
 # Because the third row of R_ENU is exactly the radial UP vector through the
 # chosen center, R_ENU @ cut_center_ecef is mathematically [0, 0, radius].
@@ -493,7 +742,11 @@ terrain_base_annulus2.apply_transform(enu_matrix)
 common_translation = np.array([0.0, 0.0, -cut_center_radius], dtype=np.float64)
 terrain_base.apply_translation(common_translation)
 terrain_base_annulus.apply_translation(common_translation)
-terrain_base_annulus2.apply_translation(common_translation)
+if _ANNULUS_TERRAINS_IDENTICAL:
+    terrain_base_annulus2 = terrain_base_annulus.copy()
+    print("Annulus 2 base terrain: REUSED exact cleaned/transformed annulus 1 terrain")
+else:
+    terrain_base_annulus2.apply_translation(common_translation)
 
 # Numerical verification of the requested condition.
 # Earth center started at [0,0,0]. Rotation leaves it at the origin; after the
@@ -547,13 +800,26 @@ _ANNULUS_BASE_MAX_Z = _annulus_base_z.max()
 
 _annulus2_base_xy = terrain_base_annulus2.vertices[:, :2]
 _annulus2_base_z = terrain_base_annulus2.vertices[:, 2]
-print("Building annulus 2-smoothed terrain interpolator...")
-_annulus2_terrain_linear = LinearNDInterpolator(
-    _annulus2_base_xy,
-    _annulus2_base_z,
-    fill_value=np.nan,
-)
-_annulus2_terrain_nearest_tree = cKDTree(_annulus2_base_xy)
+# Reuse the full interpolator/tree only when the transformed point clouds are
+# bit-for-bit identical. This is a zero-approximation optimization: if anything
+# differs, annulus 2 still builds its own interpolator exactly as before.
+if (
+    _annulus2_base_xy.shape == _annulus_base_xy.shape
+    and _annulus2_base_z.shape == _annulus_base_z.shape
+    and np.array_equal(_annulus2_base_xy, _annulus_base_xy)
+    and np.array_equal(_annulus2_base_z, _annulus_base_z)
+):
+    print("Annulus 2 terrain interpolator: REUSED from annulus 1 (identical point cloud)")
+    _annulus2_terrain_linear = _annulus_terrain_linear
+    _annulus2_terrain_nearest_tree = _annulus_terrain_nearest_tree
+else:
+    print("Building annulus 2-smoothed terrain interpolator...")
+    _annulus2_terrain_linear = LinearNDInterpolator(
+        _annulus2_base_xy,
+        _annulus2_base_z,
+        fill_value=np.nan,
+    )
+    _annulus2_terrain_nearest_tree = cKDTree(_annulus2_base_xy)
 _ANNULUS2_BASE_MAX_Z = _annulus2_base_z.max()
 
 print("Reusable terrain interpolators ready.")
@@ -653,8 +919,14 @@ def bottom_fan_faces(center_id, bottom_offset, segments=SEGMENTS):
 # OUTPUT 1: INNER CLOSED CYLINDER
 # ============================================================
 
-def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="INNER"):
-    """Build one INNER solid with one or more blind hemispherical-ended holes.
+def build_inner_model(
+    shell,
+    hole_centers_xy,
+    base_diameter_mm,
+    variant_name="INNER",
+    hole_diameter_mm=None,
+):
+    """Build one INNER solid with one or more self-supporting blind holes.
 
     hole_centers_xy is an iterable of (x, y) centers in final model coordinates:
       +X = EAST, -X = WEST, +Y = NORTH, -Y = SOUTH.
@@ -666,13 +938,32 @@ def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="IN
     BEVEL_SEGMENTS = INNER_BEVEL_SEGMENTS
     TOP_BEVEL_MM = INNER_TOP_BEVEL_MM
     TOP_BEVEL_SEGMENTS = INNER_TOP_BEVEL_SEGMENTS
-    HOLE_RADIUS_MM = INNER_BOTTOM_HOLE_DIAMETER_MM / 2.0
     HOLE_DEPTH_MM = INNER_BOTTOM_HOLE_DEPTH_MM
-    HOLE_HEMISPHERE_SEGMENTS = INNER_BOTTOM_HOLE_HEMISPHERE_SEGMENTS
 
     hole_centers_xy = np.asarray(hole_centers_xy, dtype=np.float64).reshape(-1, 2)
-    if len(hole_centers_xy) < 1:
-        raise ValueError("At least one INNER bottom-hole center is required")
+
+    # Conventional blind holes may now use either one shared diameter or one
+    # diameter per hole. This keeps the original behavior for all existing
+    # callers while allowing INNER B to use 4 mm EAST/WEST holes and a 7 mm
+    # NORTH hole.
+    if hole_diameter_mm is None:
+        hole_diameters_mm = np.full(
+            len(hole_centers_xy), INNER_BOTTOM_HOLE_DIAMETER_MM, dtype=np.float64
+        )
+    else:
+        diam = np.asarray(hole_diameter_mm, dtype=np.float64)
+        if diam.ndim == 0:
+            hole_diameters_mm = np.full(
+                len(hole_centers_xy), float(diam), dtype=np.float64
+            )
+        else:
+            hole_diameters_mm = diam.reshape(-1)
+            if len(hole_diameters_mm) != len(hole_centers_xy):
+                raise ValueError(
+                    "hole_diameter_mm must be a scalar or have one value per hole"
+                )
+
+    hole_radii_mm = hole_diameters_mm / 2.0
 
     theta = np.linspace(0, 2 * np.pi, SEGMENTS, endpoint=False)
     ct, st = np.cos(theta), np.sin(theta)
@@ -750,23 +1041,21 @@ def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="IN
     ])
 
     # ------------------------------------------------------------
-    # BLIND HOLES FROM THE BOTTOM, EACH WITH A TRUE HEMISPHERICAL END
+    # SELF-SUPPORTING BLIND HOLES FROM THE UNDERSIDE
     # Diameter = 4 mm by default.
-    # Straight cylindrical wall: Z=0 ... Z=HOLE_DEPTH_MM.
-    # Hemisphere radius = hole radius, extending another radius upward.
-    # Every cavity is closed, so the resulting mesh remains watertight.
+    # Cylindrical wall: Z=0 ... Z=HOLE_DEPTH_MM.
+    # Above that, a 45-degree conical roof closes the cavity to a point.
+    # This removes the horizontal blind-hole ceiling, so no bridge is required.
     # ------------------------------------------------------------
-    if HOLE_RADIUS_MM <= 0:
-        raise ValueError("INNER_BOTTOM_HOLE_DIAMETER_MM must be > 0")
+    if np.any(hole_radii_mm <= 0):
+        raise ValueError("Every hole diameter must be > 0")
     if HOLE_DEPTH_MM <= 0:
         raise ValueError("INNER_BOTTOM_HOLE_DEPTH_MM must be > 0")
-    if HOLE_HEMISPHERE_SEGMENTS < 2:
-        raise ValueError("INNER_BOTTOM_HOLE_HEMISPHERE_SEGMENTS must be >= 2")
 
     # Every complete opening must remain inside the flat bottom and different
     # openings must not touch or overlap one another.
     center_distances = np.linalg.norm(hole_centers_xy, axis=1)
-    outer_extents = center_distances + HOLE_RADIUS_MM
+    outer_extents = center_distances + hole_radii_mm
     if np.any(outer_extents >= bottom_radius):
         bad = int(np.argmax(outer_extents))
         raise ValueError(
@@ -780,61 +1069,53 @@ def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="IN
         pair_dist = np.linalg.norm(delta, axis=2)
         np.fill_diagonal(pair_dist, np.inf)
         min_pair = float(np.min(pair_dist))
-        if min_pair <= 2.0 * HOLE_RADIUS_MM:
+        radius_sums = hole_radii_mm[:, None] + hole_radii_mm[None, :]
+        overlap = pair_dist <= radius_sums
+        np.fill_diagonal(overlap, False)
+        if np.any(overlap):
+            ij = np.argwhere(overlap)[0]
+            i_bad, j_bad = int(ij[0]), int(ij[1])
             raise ValueError(
                 f"{variant_name}: bottom holes overlap or touch; "
-                f"minimum center spacing={min_pair:.3f} mm"
+                f"spacing={pair_dist[i_bad, j_bad]:.3f} mm, "
+                f"required>{radius_sums[i_bad, j_bad]:.3f} mm"
             )
 
     hole_geometries = []
-    deepest_z = HOLE_DEPTH_MM + HOLE_RADIUS_MM
 
     for hole_index, hole_center_xy in enumerate(hole_centers_xy):
+        hole_radius_mm = float(hole_radii_mm[hole_index])
         hole_xy = hole_center_xy + np.column_stack([
-            HOLE_RADIUS_MM * ct,
-            HOLE_RADIUS_MM * st,
+            hole_radius_mm * ct,
+            hole_radius_mm * st,
         ])
         hole_bottom_loop = np.column_stack([hole_xy, np.zeros(SEGMENTS)])
         hole_end_loop = np.column_stack([
             hole_xy,
             np.full(SEGMENTS, HOLE_DEPTH_MM),
         ])
-
-        hemisphere_rings = []
-        for k in range(1, HOLE_HEMISPHERE_SEGMENTS):
-            alpha = (np.pi / 2.0) * k / HOLE_HEMISPHERE_SEGMENTS
-            ring_r = HOLE_RADIUS_MM * np.cos(alpha)
-            ring_z = HOLE_DEPTH_MM + HOLE_RADIUS_MM * np.sin(alpha)
-            ring_xy = hole_center_xy + np.column_stack([
-                ring_r * ct,
-                ring_r * st,
-            ])
-            hemisphere_rings.append(
-                np.column_stack([ring_xy, np.full(SEGMENTS, ring_z)])
-            )
-
-        hemisphere_tip = np.array([[
+        # 45-degree self-supporting conical roof: vertical rise equals hole radius.
+        hole_roof_tip_z = HOLE_DEPTH_MM + hole_radius_mm
+        hole_roof_tip = np.array([[
             hole_center_xy[0],
             hole_center_xy[1],
-            deepest_z,
+            hole_roof_tip_z,
         ]], dtype=np.float64)
 
-        # Make sure the cavity cannot break through the terrain surface.
+        # Make sure the deepest cone tip cannot break through the terrain surface.
         check_xy = np.vstack([hole_xy, hole_center_xy.reshape(1, 2)])
         local_top_z = interpolate_border_height(check_xy)
-        if deepest_z >= float(np.min(local_top_z)):
+        if hole_roof_tip_z >= float(np.min(local_top_z)):
             raise ValueError(
-                f"{variant_name}: bottom hole {hole_index + 1} "
-                "(including hemispherical end) is too deep and would break "
-                "through the terrain surface."
+                f"{variant_name}: bottom hole {hole_index + 1} self-supporting roof "
+                "is too deep and would break through the terrain surface."
             )
 
         hole_geometries.append({
             "center": hole_center_xy,
             "bottom_loop": hole_bottom_loop,
             "end_loop": hole_end_loop,
-            "hemisphere_rings": hemisphere_rings,
-            "tip": hemisphere_tip,
+            "roof_tip": hole_roof_tip,
         })
 
     parts = [cap_vertices]
@@ -852,22 +1133,14 @@ def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="IN
     bottom_offset = sum(len(x) for x in parts)
     parts.append(bottom_loop)
 
-    # Append each hole's opening loop, cylindrical end loop, hemispherical
-    # latitude rings, and final tip. Keep their offsets for face generation.
+    # Append each hole's opening loop, cylindrical end loop, and cone tip.
     for hole in hole_geometries:
         hole["bottom_offset"] = sum(len(x) for x in parts)
         parts.append(hole["bottom_loop"])
         hole["end_offset"] = sum(len(x) for x in parts)
         parts.append(hole["end_loop"])
-
-        hemisphere_offsets = []
-        for ring in hole["hemisphere_rings"]:
-            hemisphere_offsets.append(sum(len(x) for x in parts))
-            parts.append(ring)
-        hole["hemisphere_offsets"] = hemisphere_offsets
-
-        hole["tip_id"] = sum(len(x) for x in parts)
-        parts.append(hole["tip"])
+        hole["roof_tip_id"] = sum(len(x) for x in parts)
+        parts.append(hole["roof_tip"])
 
     all_vertices = np.vstack(parts)
     face_parts = [np.asarray(top_faces, dtype=np.int64)]
@@ -941,7 +1214,7 @@ def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="IN
 
     face_parts.append(np.asarray(bottom_faces, dtype=np.int64))
 
-    # Add the cylindrical wall + hemispherical termination for every hole.
+    # Add the cylindrical wall + 45-degree conical self-supporting roof.
     for hole in hole_geometries:
         face_parts.append(
             connect_loop_faces(
@@ -951,24 +1224,12 @@ def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="IN
             )
         )
 
-        previous_offset = hole["end_offset"]
-        for current_offset in hole["hemisphere_offsets"]:
-            face_parts.append(
-                connect_loop_faces(previous_offset, current_offset, reverse=True)
-            )
-            previous_offset = current_offset
-
-        last_ring_offset = (
-            hole["hemisphere_offsets"][-1]
-            if hole["hemisphere_offsets"]
-            else hole["end_offset"]
-        )
         i = np.arange(SEGMENTS, dtype=np.int64)
         n = (i + 1) % SEGMENTS
         face_parts.append(np.column_stack([
-            last_ring_offset + i,
-            np.full(SEGMENTS, hole["tip_id"], dtype=np.int64),
-            last_ring_offset + n,
+            hole["end_offset"] + i,
+            np.full(SEGMENTS, hole["roof_tip_id"], dtype=np.int64),
+            hole["end_offset"] + n,
         ]))
 
     all_faces = np.vstack(face_parts)
@@ -988,6 +1249,553 @@ def build_inner_model(shell, hole_centers_xy, base_diameter_mm, variant_name="IN
     mesh.fix_normals()
     mesh.update_faces(mesh.unique_faces())
     mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+# ============================================================
+# EAST + WEST UNDERCUT KEYHOLE / BAYONET LOCKS -- DIRECT MESH
+# ============================================================
+
+def _signed_area_xy(loop_xy):
+    x = loop_xy[:, 0]
+    y = loop_xy[:, 1]
+    return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+
+
+def _make_curved_tube_loop(path_radius, start_angle, end_angle, widths,
+                           entry_cap_radius, stop_cap_radius, cap_samples=25,
+                            inner_widths=None):
+    """Closed CCW footprint around a circular arc.
+
+    start_angle is the LOCKED stop-pocket angle and end_angle is the ENTRY angle.
+    With end_angle > start_angle, a fixed pin travels from entry toward the stop
+    when the model itself is rotated counter-clockwise as viewed from the top.
+    """
+    widths = np.asarray(widths, dtype=np.float64).reshape(-1)
+    if len(widths) < 3:
+        raise ValueError("Keyhole path needs at least 3 side samples")
+    angles = np.linspace(float(start_angle), float(end_angle), len(widths))
+    normals = np.column_stack([np.cos(angles), np.sin(angles)])
+    centers = float(path_radius) * normals
+
+    outer_side = centers + widths[:, None] * normals
+    if inner_widths is None:
+        inner_widths = widths
+    inner_widths = np.asarray(inner_widths, dtype=np.float64).reshape(-1)
+    if len(inner_widths) != len(widths):
+        raise ValueError("Inner and outer widths must have equal sample counts")
+    inner_side = centers - inner_widths[:, None] * normals
+
+    # ENTRY cap: outer -> inner, bulging in the forward tangent direction.
+    pe = angles[-1]
+    ne = np.array([np.cos(pe), np.sin(pe)], dtype=np.float64)
+    te = np.array([-np.sin(pe), np.cos(pe)], dtype=np.float64)
+    ce = centers[-1]
+    aa = np.linspace(0.0, np.pi, int(cap_samples))
+    entry_cap = np.array([
+        ce + float(entry_cap_radius) * (np.cos(a) * ne + np.sin(a) * te)
+        for a in aa[1:]
+    ])
+
+    # Return along inner side, excluding entry point already supplied by cap.
+    inner_return = inner_side[-2::-1]
+
+    # STOP cap: inner -> outer, bulging opposite the travel direction.
+    ps = angles[0]
+    ns = np.array([np.cos(ps), np.sin(ps)], dtype=np.float64)
+    ts = np.array([-np.sin(ps), np.cos(ps)], dtype=np.float64)
+    cs = centers[0]
+    bb = np.linspace(0.0, np.pi, int(cap_samples))
+    stop_cap = np.array([
+        cs + float(stop_cap_radius) * (-np.cos(b) * ns - np.sin(b) * ts)
+        for b in bb[1:-1]
+    ])
+
+    loop = np.vstack([outer_side, entry_cap, inner_return, stop_cap])
+    if _signed_area_xy(loop) < 0:
+        loop = loop[::-1].copy()
+    return loop
+
+
+def _triangulate_known_planar_polygon(outer_xy, holes_xy, outer_offset,
+                                      hole_offsets, normal_up, variant_name):
+    """Triangulate a planar polygon while reusing exact boundary vertex IDs."""
+    holes_xy = list(holes_xy)
+    poly = Polygon(outer_xy, holes=holes_xy)
+    if poly.is_empty or not poly.is_valid:
+        raise RuntimeError(f"{variant_name}: invalid planar polygon")
+
+    mapping = {}
+    for j, xy in enumerate(outer_xy):
+        mapping[(round(float(xy[0]), 9), round(float(xy[1]), 9))] = outer_offset + j
+    for ring, off in zip(holes_xy, hole_offsets):
+        for j, xy in enumerate(ring):
+            mapping[(round(float(xy[0]), 9), round(float(xy[1]), 9))] = off + j
+
+    triangles = shapely.constrained_delaunay_triangles(poly)
+    faces = []
+    for tri_geom in triangles.geoms:
+        c = np.asarray(tri_geom.exterior.coords, dtype=np.float64)[:3, :2]
+        ids = []
+        for xy in c:
+            key = (round(float(xy[0]), 9), round(float(xy[1]), 9))
+            if key not in mapping:
+                raise RuntimeError(
+                    f"{variant_name}: planar triangulation introduced unexpected vertex {xy}"
+                )
+            ids.append(mapping[key])
+        signed2 = ((c[1,0]-c[0,0])*(c[2,1]-c[0,1])
+                   - (c[1,1]-c[0,1])*(c[2,0]-c[0,0]))
+        if (signed2 > 0) != bool(normal_up):
+            ids = [ids[0], ids[2], ids[1]]
+        faces.append(ids)
+    return np.asarray(faces, dtype=np.int64)
+
+
+def _connect_shelf_loops(head_offset, stem_offset, head_xy, stem_xy, vertices):
+    """Connect matching loops with an upward-facing retaining shelf."""
+    if len(head_xy) != len(stem_xy):
+        raise RuntimeError("Keyhole shelf loops must have identical vertex counts")
+    n = len(head_xy)
+    faces = []
+    for i in range(n):
+        j = (i + 1) % n
+        candidates = [
+            [head_offset + i, head_offset + j, stem_offset + j],
+            [head_offset + i, stem_offset + j, stem_offset + i],
+        ]
+        for ids in candidates:
+            p = vertices[np.asarray(ids, dtype=np.int64)]
+            normal_z = np.cross(p[1] - p[0], p[2] - p[0])[2]
+            # Where the two loops coincide at the entry cap, degenerate shelf
+            # triangles are intentionally omitted.
+            if abs(normal_z) < 1e-12:
+                continue
+            if normal_z < 0:
+                ids = [ids[0], ids[2], ids[1]]
+            faces.append(ids)
+    return np.asarray(faces, dtype=np.int64)
+
+
+def build_inner_east_west_keyhole_model(
+    shell,
+    base_diameter_mm,
+    variant_name="INNER EAST+WEST UNDERCUT KEYHOLES + NORTH HOLE",
+    ew_path_radius_mm=None,
+    north_hole_center_distance_mm=None,
+    north_hole_diameter_mm=None,
+):
+    """Build undercut bayonet locks at EAST and WEST plus one classic NORTH hole.
+
+    Bayonet locked stop positions:
+      * EAST = angle   0 deg at the selected E/W path radius
+      * WEST = angle 180 deg at the selected E/W path radius
+
+    Every bayonet ENTRY is at a positive angular offset from its locked stop.
+    Therefore, viewed from TOP, rotating the MODEL COUNTER-CLOCKWISE moves fixed
+    pins clockwise relative to the model from each entry to its stop pocket.
+
+    A separate conventional self-supporting blind hole is centered exactly
+    NORTH at NORTH_EXTRA_HOLE_CENTER_DISTANCE_MM and has diameter
+    NORTH_EXTRA_HOLE_DIAMETER_MM.
+    """
+    BASE_RADIUS_MM = float(base_diameter_mm) / 2.0
+    BEVEL_MM = INNER_BEVEL_MM
+    BEVEL_SEGMENTS = INNER_BEVEL_SEGMENTS
+    TOP_BEVEL_MM = INNER_TOP_BEVEL_MM
+    TOP_BEVEL_SEGMENTS = INNER_TOP_BEVEL_SEGMENTS
+
+    ew_path_radius = float(
+        EW_BAYONET_CENTER_DISTANCE_MM if ew_path_radius_mm is None else ew_path_radius_mm
+    )
+    head_radius = float(EW_BAYONET_HEAD_DIAMETER_MM) / 2.0
+    stem_radius = float(EW_BAYONET_STEM_SLOT_WIDTH_MM) / 2.0
+    lip = float(EW_BAYONET_LIP_THICKNESS_MM)
+    head_depth = float(EW_BAYONET_HEAD_CLEARANCE_DEPTH_MM)
+    rotation_deg = float(EW_BAYONET_ROTATION_DEG)
+
+    if not (ew_path_radius > 0 and head_radius > 0 and stem_radius > 0):
+        raise ValueError("Invalid bayonet dimensions")
+    if stem_radius >= head_radius:
+        raise ValueError("Stem slot must be narrower than the pin-head channel")
+    if not (0 < lip < head_depth):
+        raise ValueError("Need 0 < lip thickness < head clearance depth")
+    if not (0 < rotation_deg < 90):
+        raise ValueError("Bayonet rotation angle must be between 0 and 90 degrees")
+
+    classic_hole_diameter = float(
+        NORTH_EXTRA_HOLE_DIAMETER_MM if north_hole_diameter_mm is None else north_hole_diameter_mm
+    )
+    classic_hole_radius = classic_hole_diameter / 2.0
+    classic_hole_distance = float(
+        NORTH_EXTRA_HOLE_CENTER_DISTANCE_MM
+        if north_hole_center_distance_mm is None
+        else north_hole_center_distance_mm
+    )
+    classic_hole_depth = float(INNER_BOTTOM_HOLE_DEPTH_MM)
+    if classic_hole_radius <= 0 or classic_hole_distance <= 0:
+        raise ValueError("Invalid additional NORTH hole dimensions")
+
+    theta = np.linspace(0, 2*np.pi, SEGMENTS, endpoint=False)
+    ct, st = np.cos(theta), np.sin(theta)
+    z_shift = shell.vertices[:, 2].max() - _BASE_MAX_Z
+
+    def interpolate_border_height(points_xy):
+        return interpolate_terrain_height(points_xy, z_shift=z_shift)
+
+    # ---------- top terrain and outer body ----------
+    top_inner_radius = BASE_RADIUS_MM - TOP_BEVEL_MM
+    top_inner_xy = np.column_stack([top_inner_radius*ct, top_inner_radius*st])
+    top_inner_z = interpolate_border_height(top_inner_xy)
+    top_loop = np.column_stack([top_inner_xy, top_inner_z])
+
+    r = np.linalg.norm(shell.vertices[:, :2], axis=1)
+    terrain_points = shell.vertices[r <= top_inner_radius]
+    if len(terrain_points):
+        dist, _ = cKDTree(top_inner_xy).query(terrain_points[:, :2], k=1)
+        terrain_points = terrain_points[dist > 1e-6]
+
+    cap_vertices = np.vstack([terrain_points, top_loop])
+    top_boundary_offset = len(terrain_points)
+    tri = Delaunay(cap_vertices[:, :2])
+    top_faces = tri.simplices
+    centers = np.mean(cap_vertices[top_faces][:, :, :2], axis=1)
+    top_faces = top_faces[np.linalg.norm(centers, axis=1) <= top_inner_radius]
+
+    top_bevel_rings = []
+    if TOP_BEVEL_MM > 0:
+        for k in range(1, TOP_BEVEL_SEGMENTS + 1):
+            phi = (np.pi/2)*k/TOP_BEVEL_SEGMENTS
+            ring_r = BASE_RADIUS_MM - TOP_BEVEL_MM + TOP_BEVEL_MM*np.sin(phi)
+            ring_xy = np.column_stack([ring_r*ct, ring_r*st])
+            terrain_ring_z = interpolate_border_height(ring_xy)
+            bevel_drop = TOP_BEVEL_MM*(1.0-np.cos(phi))
+            top_bevel_rings.append(np.column_stack([ring_xy, terrain_ring_z-bevel_drop]))
+
+    bevel_rings = []
+    if BEVEL_MM > 0:
+        for k in range(BEVEL_SEGMENTS):
+            phi = (np.pi/2)*k/BEVEL_SEGMENTS
+            ring_r = BASE_RADIUS_MM - BEVEL_MM + BEVEL_MM*np.cos(phi)
+            ring_z = BEVEL_MM - BEVEL_MM*np.sin(phi)
+            bevel_rings.append(np.column_stack([
+                ring_r*ct, ring_r*st, np.full(SEGMENTS, ring_z)
+            ]))
+
+    bottom_radius = BASE_RADIUS_MM - max(BEVEL_MM, 0.0)
+    bottom_xy = np.column_stack([bottom_radius*ct, bottom_radius*st])
+    bottom_loop = np.column_stack([bottom_xy, np.zeros(SEGMENTS)])
+
+    # ---------- EAST + WEST bayonet footprints ----------
+    rotation_rad = np.deg2rad(rotation_deg)
+    # +X EAST=0°, +Y NORTH=90°, -X WEST=180°.
+    # entry = stop + positive angle => model locks CCW viewed from TOP.
+    lock_specs = [
+        ("EAST", 0.0, ew_path_radius, int(EW_BAYONET_ARC_SAMPLES)),
+        ("WEST", np.pi, ew_path_radius, int(EW_BAYONET_ARC_SAMPLES)),
+    ]
+    keyholes = []
+
+    for label, stop_angle, path_radius, arc_samples in lock_specs:
+        entry_angle = stop_angle + rotation_rad
+        # Dense paired loops preserve the circular entry with sub-micron chord error.
+        side_samples = max(256, arc_samples)
+        cap_samples = 97
+
+        head_widths = np.full(side_samples, head_radius, dtype=np.float64)
+        head_xy = _make_curved_tube_loop(
+            path_radius, stop_angle, entry_angle, head_widths,
+            entry_cap_radius=head_radius,
+            stop_cap_radius=head_radius,
+            cap_samples=cap_samples,
+        )
+
+        # Bottom opening = narrow curved stem slot UNION full circular entry.
+        # Intersect each radial ray with the entry circle analytically.  The
+        # outer and inner widths differ slightly because the path is curved.
+        # Keep paired vertices with the head loop for the retaining shelf.
+        angles = np.linspace(stop_angle, entry_angle, side_samples)
+        delta = entry_angle - angles
+        projection = path_radius * np.cos(delta)
+        discriminant = head_radius**2 - (path_radius * np.sin(delta))**2
+        hit = discriminant >= 0.0
+        half_chord = np.sqrt(np.maximum(discriminant, 0.0))
+        outer_widths = np.where(hit, np.maximum(stem_radius,
+            projection + half_chord - path_radius), stem_radius)
+        inner_widths = np.where(hit, np.maximum(stem_radius,
+            path_radius - projection + half_chord), stem_radius)
+        # Exact common endpoints avoid tiny floating point shelf slivers.
+        outer_widths[-1] = inner_widths[-1] = head_radius
+        outer_widths[0] = inner_widths[0] = stem_radius
+        opening_xy = _make_curved_tube_loop(
+            path_radius, stop_angle, entry_angle, outer_widths,
+            entry_cap_radius=head_radius,
+            stop_cap_radius=stem_radius,
+            cap_samples=cap_samples,
+            inner_widths=inner_widths,
+        )
+
+        if len(head_xy) != len(opening_xy):
+            raise RuntimeError(f"{variant_name} {label}: paired loops have different sizes")
+        head_poly = Polygon(head_xy)
+        opening_poly = Polygon(opening_xy)
+        if not head_poly.is_valid or not opening_poly.is_valid:
+            raise RuntimeError(f"{variant_name} {label}: invalid keyhole footprint")
+        if not head_poly.covers(opening_poly):
+            raise RuntimeError(f"{variant_name} {label}: stem opening is not inside head channel")
+
+        entry_center = Point(path_radius * np.cos(entry_angle),
+                             path_radius * np.sin(entry_angle))
+        # A polygon approximates the circle; allow at most 0.01 mm radial error.
+        if (not opening_poly.covers(entry_center) or
+                opening_poly.boundary.distance(entry_center) < head_radius - 0.01):
+            raise RuntimeError(f"{variant_name} {label}: circular entry clearance is too small")
+
+        max_r = float(np.max(np.linalg.norm(head_xy, axis=1)))
+        if max_r >= bottom_radius - 1e-6:
+            raise ValueError(
+                f"{variant_name} {label}: head channel reaches lower bevel: "
+                f"max radius={max_r:.3f} mm, flat-bottom radius={bottom_radius:.3f} mm"
+            )
+
+        local_top = interpolate_border_height(head_xy)
+
+        # Preserve the full hidden head-channel clearance up to head_depth, then
+        # close the cavity with a 45-degree roof.  Because this footprint is a
+        # curved tube, progressively reduce its half-width while keeping the
+        # same centerline.  The final 0.2-mm-wide ridge is below one nozzle width.
+        final_half_width = float(BAYONET_ROOF_FINAL_HALF_WIDTH_MM)
+        if not (0.0 < final_half_width < head_radius):
+            raise ValueError("BAYONET_ROOF_FINAL_HALF_WIDTH_MM must be > 0 and < head radius")
+        roof_rise = head_radius - final_half_width
+        roof_top_z = head_depth + roof_rise
+        if roof_top_z >= float(np.min(local_top)):
+            raise ValueError(
+                f"{variant_name} {label}: self-supporting bayonet roof would break through terrain"
+            )
+
+        roof_steps = max(1, int(np.ceil(roof_rise / BAYONET_ROOF_STEP_MM)))
+        roof_loops_xy = []
+        for roof_k in range(1, roof_steps + 1):
+            rise = min(roof_rise, roof_k * roof_rise / roof_steps)
+            roof_half_width = head_radius - rise
+            roof_widths = np.full(side_samples, roof_half_width, dtype=np.float64)
+            roof_xy = _make_curved_tube_loop(
+                path_radius, stop_angle, entry_angle, roof_widths,
+                entry_cap_radius=roof_half_width,
+                stop_cap_radius=roof_half_width,
+                cap_samples=cap_samples,
+            )
+            roof_z = head_depth + rise
+            roof_loops_xy.append((roof_xy, roof_z))
+
+        keyholes.append({
+            "label": label,
+            "stop_angle": stop_angle,
+            "entry_angle": entry_angle,
+            "path_radius": path_radius,
+            "head_xy": head_xy,
+            "opening_xy": opening_xy,
+            "head_poly": head_poly,
+            "opening_poly": opening_poly,
+            "roof_loops_xy": roof_loops_xy,
+        })
+
+    # Every hidden head channel must be independent.
+    for i in range(len(keyholes)):
+        for j in range(i+1, len(keyholes)):
+            if keyholes[i]["head_poly"].intersects(keyholes[j]["head_poly"]):
+                raise ValueError(
+                    f"{variant_name}: {keyholes[i]['label']} and {keyholes[j]['label']} "
+                    "hidden head channels overlap/touch"
+                )
+
+    # ---------- conventional NORTH Ø7 mm self-supporting blind hole ----------
+    classic_center = np.array([0.0, classic_hole_distance], dtype=np.float64)
+    classic_xy = classic_center + np.column_stack([
+        classic_hole_radius*ct, classic_hole_radius*st
+    ])
+    classic_bottom_loop = np.column_stack([classic_xy, np.zeros(SEGMENTS)])
+    classic_end_loop = np.column_stack([
+        classic_xy, np.full(SEGMENTS, classic_hole_depth)
+    ])
+    classic_roof_tip_z = classic_hole_depth + classic_hole_radius
+    classic_roof_tip = np.array([[
+        classic_center[0], classic_center[1], classic_roof_tip_z
+    ]], dtype=np.float64)
+
+    if classic_hole_distance + classic_hole_radius >= bottom_radius - 1e-6:
+        raise ValueError(
+            f"{variant_name}: additional NORTH hole reaches lower bevel: "
+            f"center+radius={classic_hole_distance + classic_hole_radius:.3f} mm, "
+            f"flat-bottom radius={bottom_radius:.3f} mm"
+        )
+    local_top = interpolate_border_height(np.vstack([classic_xy, classic_center.reshape(1,2)]))
+    if classic_roof_tip_z >= float(np.min(local_top)):
+        raise ValueError(f"{variant_name}: additional NORTH self-supporting hole would break through terrain")
+
+    classic_poly = Point(float(classic_center[0]), float(classic_center[1])).buffer(
+        classic_hole_radius, quad_segs=max(16, SEGMENTS//4)
+    )
+    for kh in keyholes:
+        if kh["head_poly"].intersects(classic_poly):
+            raise ValueError(
+                f"{variant_name}: additional NORTH hole overlaps/touches {kh['label']} bayonet head channel"
+            )
+
+    # ---------- body vertices ----------
+    parts = [cap_vertices]
+    face_parts = [np.asarray(top_faces, dtype=np.int64)]
+
+    top_bevel_offsets = []
+    for ring in top_bevel_rings:
+        top_bevel_offsets.append(sum(len(x) for x in parts))
+        parts.append(ring)
+    bevel_offsets = []
+    for ring in bevel_rings:
+        bevel_offsets.append(sum(len(x) for x in parts))
+        parts.append(ring)
+
+    bottom_offset = sum(len(x) for x in parts)
+    parts.append(bottom_loop)
+
+    # Four main loops per bayonet, followed by self-supporting roof loops.
+    for kh in keyholes:
+        opening_xy = kh["opening_xy"]
+        head_xy = kh["head_xy"]
+        kh["opening_bottom_offset"] = sum(len(x) for x in parts)
+        parts.append(np.column_stack([opening_xy, np.zeros(len(opening_xy))]))
+        kh["opening_lip_offset"] = sum(len(x) for x in parts)
+        parts.append(np.column_stack([opening_xy, np.full(len(opening_xy), lip)]))
+        kh["head_lip_offset"] = sum(len(x) for x in parts)
+        parts.append(np.column_stack([head_xy, np.full(len(head_xy), lip)]))
+        kh["head_top_offset"] = sum(len(x) for x in parts)
+        parts.append(np.column_stack([head_xy, np.full(len(head_xy), head_depth)]))
+        kh["roof_offsets"] = []
+        for roof_xy, roof_z in kh["roof_loops_xy"]:
+            kh["roof_offsets"].append(sum(len(x) for x in parts))
+            parts.append(np.column_stack([roof_xy, np.full(len(roof_xy), roof_z)]))
+
+    # Classic hole opening loop, cylindrical end loop, and conical roof tip.
+    classic_bottom_offset = sum(len(x) for x in parts)
+    parts.append(classic_bottom_loop)
+    classic_end_offset = sum(len(x) for x in parts)
+    parts.append(classic_end_loop)
+    classic_roof_tip_id = sum(len(x) for x in parts)
+    parts.append(classic_roof_tip)
+
+    # ---------- outer body faces ----------
+    if top_bevel_offsets:
+        prev = top_boundary_offset
+        for cur in top_bevel_offsets:
+            face_parts.append(connect_loop_faces(prev, cur))
+            prev = cur
+        side_top = top_bevel_offsets[-1]
+    else:
+        side_top = top_boundary_offset
+
+    side_bottom = bevel_offsets[0] if bevel_offsets else bottom_offset
+    face_parts.append(connect_loop_faces(side_top, side_bottom))
+    for a_off, b_off in zip(bevel_offsets[:-1], bevel_offsets[1:]):
+        face_parts.append(connect_loop_faces(a_off, b_off))
+    if bevel_offsets:
+        face_parts.append(connect_loop_faces(bevel_offsets[-1], bottom_offset))
+
+    # Flat bottom contains two bayonet openings + one classic circular hole.
+    face_parts.append(_triangulate_known_planar_polygon(
+        bottom_xy,
+        [kh["opening_xy"] for kh in keyholes] + [classic_xy],
+        bottom_offset,
+        [kh["opening_bottom_offset"] for kh in keyholes] + [classic_bottom_offset],
+        normal_up=False,
+        variant_name=variant_name,
+    ))
+
+    current_vertices = np.vstack(parts)
+    for kh in keyholes:
+        opening_xy = kh["opening_xy"]
+        head_xy = kh["head_xy"]
+
+        face_parts.append(connect_loop_faces(
+            kh["opening_bottom_offset"], kh["opening_lip_offset"],
+            segments=len(opening_xy), reverse=True,
+        ))
+
+        shelf_faces = _connect_shelf_loops(
+            kh["head_lip_offset"], kh["opening_lip_offset"],
+            head_xy, opening_xy, current_vertices,
+        )
+        if len(shelf_faces):
+            face_parts.append(shelf_faces)
+
+        face_parts.append(connect_loop_faces(
+            kh["head_lip_offset"], kh["head_top_offset"],
+            segments=len(head_xy), reverse=True,
+        ))
+
+        # 45-degree roof above the full-clearance head channel.
+        previous_offset = kh["head_top_offset"]
+        previous_xy = head_xy
+        for roof_offset, (roof_xy, roof_z) in zip(kh["roof_offsets"], kh["roof_loops_xy"]):
+            if len(previous_xy) != len(roof_xy):
+                raise RuntimeError(f"{variant_name} {kh['label']}: bayonet roof loop size mismatch")
+            face_parts.append(connect_loop_faces(
+                previous_offset, roof_offset,
+                segments=len(roof_xy), reverse=True,
+            ))
+            previous_offset = roof_offset
+            previous_xy = roof_xy
+
+        # Only a sub-nozzle-width ridge remains at the very top.
+        face_parts.append(_triangulate_known_planar_polygon(
+            previous_xy, [], previous_offset, [],
+            normal_up=False, variant_name=f"{variant_name} {kh['label']} roof ridge",
+        ))
+
+    # Conventional NORTH hole cylindrical wall + 45-degree conical roof.
+    face_parts.append(connect_loop_faces(
+        classic_bottom_offset, classic_end_offset,
+        segments=SEGMENTS, reverse=True,
+    ))
+    ii = np.arange(SEGMENTS, dtype=np.int64)
+    nn = (ii + 1) % SEGMENTS
+    face_parts.append(np.column_stack([
+        classic_end_offset + ii,
+        np.full(SEGMENTS, classic_roof_tip_id, dtype=np.int64),
+        classic_end_offset + nn,
+    ]))
+
+    mesh = trimesh.Trimesh(
+        vertices=np.vstack(parts),
+        faces=np.vstack(face_parts),
+        process=False,
+    )
+    print(f"Cleaning {variant_name} direct-mesh geometry...")
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+    mesh.merge_vertices(digits_vertex=7)
+
+    repair.fill_holes(mesh)
+    mesh.fix_normals()
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+
+    edges = mesh.edges_sorted
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    boundary_edges = int(np.sum(counts == 1))
+    nonmanifold_edges = int(np.sum(counts > 2))
+    if (not mesh.is_watertight) or boundary_edges or nonmanifold_edges:
+        boundary_z = []
+        if boundary_edges:
+            boundary_edge_ids = np.unique(edges[np.asarray(counts) == 1])
+            if len(boundary_edge_ids):
+                bz = mesh.vertices[boundary_edge_ids, 2]
+                boundary_z = [float(np.min(bz)), float(np.max(bz))]
+        raise RuntimeError(
+            f"{variant_name}: direct keyhole mesh is not watertight AFTER repair "
+            f"(boundary={boundary_edges}, nonmanifold={nonmanifold_edges}, "
+            f"boundary_z_range={boundary_z})"
+        )
     return mesh
 
 
@@ -1386,63 +2194,507 @@ def build_annulus2_model(shell):
 
 
 # ============================================================
-# BUILD TWO INNER VARIANTS + TWO OUTER ANNULI FROM THE SAME TIFF
+# BOTTOM ENGRAVING HELPERS
+# ============================================================
+
+def _clean_boolean_mesh(mesh, title):
+    """Light cleanup + strict topology check after a manifold boolean."""
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+    mesh.remove_unreferenced_vertices()
+    mesh.merge_vertices(digits_vertex=7)
+    repair.fill_holes(mesh)
+    mesh.fix_normals()
+    mesh.update_faces(mesh.unique_faces())
+    mesh.remove_unreferenced_vertices()
+
+    edges = mesh.edges_sorted
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    boundary = int(np.sum(counts == 1))
+    nonmanifold = int(np.sum(counts > 2))
+    if (not mesh.is_watertight) or boundary or nonmanifold:
+        raise RuntimeError(
+            f"{title}: engraving boolean produced an invalid mesh "
+            f"(watertight={mesh.is_watertight}, boundary={boundary}, nonmanifold={nonmanifold})"
+        )
+    return mesh
+
+
+def _tm_to_manifold_direct(tm, label="mesh"):
+    from manifold3d import Manifold as _M3DManifold, Mesh as _M3DMesh
+    m3 = _M3DMesh(
+        vert_properties=np.asarray(tm.vertices, dtype=np.float32),
+        tri_verts=np.asarray(tm.faces, dtype=np.uint32),
+    )
+    solid = _M3DManifold(m3)
+    if "NoError" not in str(solid.status()):
+        raise RuntimeError(f"manifold3d rejected {label}: {solid.status()}")
+    return solid
+
+
+def _manifold_to_tm_direct(solid):
+    raw = solid.to_mesh()
+    return trimesh.Trimesh(
+        vertices=np.asarray(raw.vert_properties, dtype=np.float64)[:, :3],
+        faces=np.asarray(raw.tri_verts, dtype=np.int64),
+        process=False,
+    )
+
+
+def _extrude_shapely_geom(geom, height, z0):
+    pieces = []
+    geoms = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+    for poly in geoms:
+        if poly.is_empty or poly.area <= 1e-10:
+            continue
+        if poly.geom_type != "Polygon":
+            continue
+        m = trimesh.creation.extrude_polygon(poly, height=float(height), engine="earcut")
+        m.apply_translation([0.0, 0.0, float(z0)])
+        pieces.append(m)
+    if not pieces:
+        return None
+    return trimesh.util.concatenate(pieces)
+
+
+def _make_self_supporting_recess_cutter(geom, label):
+    """Straight 5 mm recess with vertical walls and a flat horizontal ceiling."""
+    if geom is None or geom.is_empty:
+        raise RuntimeError(f"Empty engraving footprint for {label}")
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+    if geom.is_empty:
+        raise RuntimeError(f"Invalid engraving footprint for {label}")
+
+    # Start slightly below Z=0 so the boolean cutter cleanly crosses the bottom face.
+    # The top is EXACTLY at BOTTOM_ENGRAVING_DEPTH_MM, producing a flat ceiling.
+    result = _extrude_shapely_geom(
+        geom,
+        BOTTOM_ENGRAVING_DEPTH_MM + BOTTOM_ENGRAVING_EPS_MM,
+        -BOTTOM_ENGRAVING_EPS_MM,
+    )
+    if result is None:
+        raise RuntimeError(f"Could not extrude engraving footprint for {label}")
+    result.fix_normals(multibody=True)
+    return result
+
+
+def _planar_footprint_from_extruded_mesh(mesh, z_section_mm):
+    """Recover the filled XY footprint (including counters/holes) from an extrusion."""
+    section = mesh.section(
+        plane_origin=[0.0, 0.0, float(z_section_mm)],
+        plane_normal=[0.0, 0.0, 1.0],
+    )
+    if section is None:
+        raise RuntimeError("Could not section engraving cutter for insert generation")
+
+    geom = None
+    for loop3d in section.discrete:
+        loop_xy = np.asarray(loop3d, dtype=np.float64)[:, :2]
+        if len(loop_xy) < 3:
+            continue
+        p = Polygon(loop_xy)
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty or p.area <= 1e-10:
+            continue
+        geom = p if geom is None else geom.symmetric_difference(p)
+
+    if geom is None or geom.is_empty:
+        raise RuntimeError("Engraving cutter did not yield a usable insert footprint")
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+    return geom
+
+
+def _make_bottom_insert_piece_from_cutter(cutter):
+    """Create one 5 mm press-in artwork piece with the requested XY clearance."""
+    if BOTTOM_INSERT_HEIGHT_MM <= 0:
+        raise ValueError("BOTTOM_INSERT_HEIGHT_MM must be > 0")
+    if BOTTOM_INSERT_TOTAL_XY_REDUCTION_MM < 0:
+        raise ValueError("BOTTOM_INSERT_TOTAL_XY_REDUCTION_MM must be >= 0")
+
+    geom = _planar_footprint_from_extruded_mesh(
+        cutter,
+        z_section_mm=0.5 * BOTTOM_ENGRAVING_DEPTH_MM,
+    )
+
+    # Half the requested total reduction is removed from every edge.
+    # With 0.30 mm total reduction this gives 0.15 mm clearance per side.
+    inset = 0.5 * float(BOTTOM_INSERT_TOTAL_XY_REDUCTION_MM)
+    if inset > 0:
+        geom = geom.buffer(-inset, join_style="mitre")
+        if geom.is_empty:
+            raise RuntimeError(
+                "Insert clearance removed all artwork geometry; reduce "
+                "BOTTOM_INSERT_TOTAL_XY_REDUCTION_MM."
+            )
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+
+    piece = _extrude_shapely_geom(geom, BOTTOM_INSERT_HEIGHT_MM, 0.0)
+    if piece is None:
+        raise RuntimeError("Could not extrude separate bottom logo/text insert piece")
+    piece.remove_unreferenced_vertices()
+    piece.merge_vertices()
+    piece.fix_normals(multibody=True)
+    return piece
+
+
+def _make_compact_bottom_insert_from_cutters(cutters):
+    """Arrange press-in artwork compactly for printing.
+
+    All normal rows use an exact 5 mm edge-to-edge vertical gap.  The final curved
+    material-text row is handled specially: its CENTER section is placed 5 mm below
+    the preceding N marker.  Using the global top of an arc would leave a large
+    visual hole below N because the arc ends sit much higher than its middle.
+
+    This affects ONLY the separate print-layout STL.  Engraving locations in both
+    INNER models are unchanged.
+    """
+    gap = float(BOTTOM_INSERT_LAYOUT_GAP_MM)
+    if gap < 0:
+        raise ValueError("BOTTOM_INSERT_LAYOUT_GAP_MM must be >= 0")
+    if not cutters:
+        raise RuntimeError("No artwork cutters supplied for compact insert layout")
+
+    pieces = []
+    previous_bottom_y = None
+    previous_piece = None
+
+    for index, cutter in enumerate(cutters):
+        piece = _make_bottom_insert_piece_from_cutter(cutter)
+
+        # Center every complete artwork row on X=0.
+        center_x = 0.5 * float(piece.bounds[0, 0] + piece.bounds[1, 0])
+        piece.apply_translation([-center_x, 0.0, 0.0])
+
+        is_last_piece = (index == len(cutters) - 1)
+        is_curved_material = bool(BOTTOM_PLA_CURVED and is_last_piece)
+
+        if previous_bottom_y is None:
+            # Put the top edge of the logo/first item at Y=0 and stack downward.
+            dy = -float(piece.bounds[1, 1])
+        elif is_curved_material:
+            # For the curved line, anchor the CENTRAL part of the arc under the
+            # previous row (normally N).  This makes the visible central gap 5 mm
+            # instead of measuring against the much higher arc endpoints.
+            prev_width = float(previous_piece.bounds[1, 0] - previous_piece.bounds[0, 0])
+            center_half_width = max(6.0, 0.75 * prev_width)
+            verts = piece.vertices
+            central = np.abs(verts[:, 0]) <= center_half_width
+            if not np.any(central):
+                # Robust fallback: use the 10% of vertices closest to X=0.
+                order = np.argsort(np.abs(verts[:, 0]))
+                count = max(1, int(np.ceil(0.10 * len(order))))
+                central = np.zeros(len(verts), dtype=bool)
+                central[order[:count]] = True
+            central_top_y = float(np.max(verts[central, 1]))
+            dy = (previous_bottom_y - gap) - central_top_y
+        else:
+            # Exact edge-to-edge gap between ordinary consecutive rows.
+            dy = (previous_bottom_y - gap) - float(piece.bounds[1, 1])
+
+        piece.apply_translation([0.0, dy, 0.0])
+        previous_bottom_y = float(piece.bounds[0, 1])
+        previous_piece = piece
+        pieces.append(piece)
+
+    insert = trimesh.util.concatenate(pieces)
+    insert.remove_unreferenced_vertices()
+    insert.merge_vertices()
+    insert.fix_normals(multibody=True)
+    print(
+        f"Compact insert STL layout: {len(pieces)} artwork rows; "
+        f"ordinary gaps={gap:.2f} mm and curved-text CENTER gap={gap:.2f} mm."
+    )
+    return insert
+
+
+def _text_filled_geometry(text):
+    """Convert TrueType text contours to a filled Shapely geometry."""
+    prop = FontProperties(
+        family=BOTTOM_TEXT_FONT_FAMILY,
+        weight="bold" if BOTTOM_TEXT_BOLD else "normal",
+    )
+    path = TextPath((0.0, 0.0), str(text), size=1.0, prop=prop)
+    contours = path.to_polygons()
+    geom = None
+    for contour in contours:
+        if len(contour) < 3:
+            continue
+        p = Polygon(contour)
+        if p.is_empty or p.area <= 1e-12:
+            continue
+        if not p.is_valid:
+            p = p.buffer(0)
+        if p.is_empty:
+            continue
+        geom = p if geom is None else geom.symmetric_difference(p)
+    if geom is None or geom.is_empty:
+        raise RuntimeError(f"Could not create vector geometry for text: {text!r}")
+    if not geom.is_valid:
+        geom = geom.buffer(0)
+    return geom
+
+
+def _scaled_text_geometry(text, target_height_mm=None, max_width_mm=None, xy_scale=1.0,
+                          y_anchor="center"):
+    geom = _text_filled_geometry(text)
+    minx, miny, maxx, maxy = geom.bounds
+    width = maxx - minx
+    height = maxy - miny
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Invalid text bounds for {text!r}: {geom.bounds}")
+    if xy_scale <= 0:
+        raise ValueError("Text xy_scale must be > 0")
+
+    if target_height_mm is None:
+        target_height_mm = BOTTOM_TEXT_HEIGHT_MM * xy_scale
+    if max_width_mm is None:
+        max_width_mm = BOTTOM_TEXT_MAX_WIDTH_MM * xy_scale
+
+    factor = target_height_mm / height
+    if width * factor > max_width_mm:
+        factor = max_width_mm / width
+    geom = shapely_scale(geom, xfact=factor, yfact=factor, origin=(0.0, 0.0))
+
+    minx, miny, maxx, maxy = geom.bounds
+    cx = 0.5 * (minx + maxx)
+    if y_anchor == "center":
+        yoff = -0.5 * (miny + maxy)
+    elif y_anchor == "bottom":
+        yoff = -miny
+    else:
+        raise ValueError(f"Unsupported y_anchor={y_anchor!r}")
+    geom = shapely_translate(geom, xoff=-cx, yoff=yoff)
+    return geom
+
+
+def _make_text_cutter(text, center_y_mm, target_height_mm=None, max_width_mm=None,
+                      xy_scale=1.0):
+    geom = _scaled_text_geometry(
+        text,
+        target_height_mm=target_height_mm,
+        max_width_mm=max_width_mm,
+        xy_scale=xy_scale,
+        y_anchor="center",
+    )
+    geom = shapely_translate(geom, xoff=0.0, yoff=center_y_mm)
+    if BOTTOM_MIRROR_X_FOR_UNDERSIDE:
+        geom = shapely_scale(geom, xfact=-1.0, yfact=1.0, origin=(0.0, 0.0))
+
+    return _make_self_supporting_recess_cutter(geom, f"text {text!r}")
+
+
+def _make_curved_text_cutter(text, outer_radius_mm, center_angle_deg=-90.0,
+                             target_height_mm=None, max_width_mm=None, xy_scale=1.0):
+    if outer_radius_mm <= 0:
+        raise ValueError("outer_radius_mm must be > 0")
+
+    geom = _scaled_text_geometry(
+        text,
+        target_height_mm=target_height_mm,
+        max_width_mm=max_width_mm,
+        xy_scale=xy_scale,
+        y_anchor="bottom",
+    )
+
+    center_angle_rad = np.deg2rad(float(center_angle_deg))
+    outer_radius_mm = float(outer_radius_mm)
+
+    def _curve_coords(coords):
+        arr = np.asarray(coords, dtype=np.float64).copy()
+        x = arr[:, 0]
+        y = arr[:, 1]
+        theta = center_angle_rad + x / outer_radius_mm
+        radius = outer_radius_mm - y
+        arr[:, 0] = radius * np.cos(theta)
+        arr[:, 1] = radius * np.sin(theta)
+        return arr
+
+    geom = shapely.transform(geom, _curve_coords)
+    if BOTTOM_MIRROR_X_FOR_UNDERSIDE:
+        geom = shapely_scale(geom, xfact=-1.0, yfact=1.0, origin=(0.0, 0.0))
+
+    return _make_self_supporting_recess_cutter(geom, f"curved text {text!r}")
+
+# Only the north marker "N" is engraved on both INNER undersides.
+# The separate press-in STL contains exactly the same single "N".
+_BOTTOM_ENGRAVING_CUTTER_CACHE = {}
+_BOTTOM_ENGRAVING_INSERT_CACHE = {}
+
+def engrave_inner_bottom(mesh, variant_name):
+    if not BOTTOM_ENGRAVING_ENABLED:
+        return mesh
+
+    print(f"\nEngraving only N on the underside of {variant_name}...")
+    cache_key = (
+        str(BOTTOM_NORTH_MARKER_TEXT),
+        float(BOTTOM_NORTH_MARKER_SCALE),
+        float(BOTTOM_TEXT_SIZE_REFERENCE_WIDTH_MM),
+        str(BOTTOM_TEXT_SIZE_REFERENCE),
+        str(BOTTOM_TEXT_FONT_FAMILY),
+        bool(BOTTOM_TEXT_BOLD),
+        bool(BOTTOM_MIRROR_X_FOR_UNDERSIDE),
+        float(BOTTOM_ENGRAVING_CENTER_X_MM),
+        float(BOTTOM_NORTH_MARKER_GAP_MM),
+        float(BOTTOM_NORTH_MARKER_INWARD_SHIFT_MM),
+        float(NORTH_EXTRA_HOLE_CENTER_DISTANCE_MM),
+        float(NORTH_EXTRA_HOLE_DIAMETER_MM),
+        float(BOTTOM_ENGRAVING_DEPTH_MM),
+        float(BOTTOM_ENGRAVING_EPS_MM),
+        float(BOTTOM_INSERT_HEIGHT_MM),
+        float(BOTTOM_INSERT_TOTAL_XY_REDUCTION_MM),
+    )
+    cutter = _BOTTOM_ENGRAVING_CUTTER_CACHE.get(cache_key)
+    if cutter is None:
+        if BOTTOM_NORTH_MARKER_TEXT != "N":
+            raise ValueError('BOTTOM_NORTH_MARKER_TEXT must be "N".')
+
+        # Preserve N font size, depth and orientation; move its cavity inward by 10 mm.
+        text_size_reference = _make_text_cutter(
+            BOTTOM_TEXT_SIZE_REFERENCE,
+            0.0,
+            target_height_mm=1.0e6,
+            max_width_mm=BOTTOM_TEXT_SIZE_REFERENCE_WIDTH_MM,
+            xy_scale=1.0,
+        )
+        common_text_height_mm = float(
+            text_size_reference.bounds[1, 1] - text_size_reference.bounds[0, 1]
+        )
+        north_marker = _make_text_cutter(
+            "N",
+            0.0,
+            target_height_mm=common_text_height_mm * BOTTOM_NORTH_MARKER_SCALE,
+            max_width_mm=np.inf,
+            xy_scale=1.0,
+        )
+        north_marker_center_y = (
+            NORTH_EXTRA_HOLE_CENTER_DISTANCE_MM
+            - 0.5 * NORTH_EXTRA_HOLE_DIAMETER_MM
+            - BOTTOM_NORTH_MARKER_GAP_MM
+            - BOTTOM_NORTH_MARKER_INWARD_SHIFT_MM
+            - 0.5 * float(north_marker.bounds[1, 1] - north_marker.bounds[0, 1])
+        )
+        north_marker.apply_translation([
+            BOTTOM_ENGRAVING_CENTER_X_MM, north_marker_center_y, 0.0
+        ])
+        cutter = north_marker
+        _BOTTOM_ENGRAVING_CUTTER_CACHE[cache_key] = cutter.copy()
+        _BOTTOM_ENGRAVING_INSERT_CACHE[cache_key] = (
+            _make_compact_bottom_insert_from_cutters([north_marker])
+        )
+        print(f"N marker center Y: {north_marker_center_y:.2f} mm")
+    else:
+        cutter = cutter.copy()
+        print("Reusing cached N-only engraving cutter and insert.")
+
+    footprint_radius = float(np.max(np.linalg.norm(cutter.vertices[:, :2], axis=1)))
+    flat_radius = min(INNER_BASE_DIAMETER_MM, INNER_BASE_DIAMETER2_MM) / 2.0 - INNER_BEVEL_MM
+    if footprint_radius >= flat_radius:
+        raise ValueError(
+            f"N engraving reaches radius {footprint_radius:.2f} mm, "
+            f"but common flat-bottom radius is only {flat_radius:.2f} mm."
+        )
+
+    body_m3 = _tm_to_manifold_direct(mesh, f"{variant_name} body")
+    cutter_m3 = _tm_to_manifold_direct(cutter, f"{variant_name} N cutter")
+    result_m3 = body_m3 - cutter_m3
+    result = _manifold_to_tm_direct(result_m3)
+    result = _clean_boolean_mesh(result, variant_name)
+    print(
+        f"N-only engraving OK: depth={BOTTOM_ENGRAVING_DEPTH_MM:.2f} mm; "
+        f"insert XY clearance={BOTTOM_INSERT_TOTAL_XY_REDUCTION_MM:.2f} mm"
+    )
+    return result
+
+
+# ============================================================
+# BUILD BOTH INNER MODELS AND BOTH ANNULI
 # ============================================================
 
 inner_terrain = terrain_at_top_height(terrain_base, INNER_TOP_HEIGHT_MM)
 print("Inner terrain Z:", inner_terrain.vertices[:, 2].min(), inner_terrain.vertices[:, 2].max())
 
-# Variant A: original requested hole exactly SOUTH, 84 mm from center.
-south_hole_centers = np.array([
-    [0.0, -INNER_BOTTOM_HOLE_CENTER_DISTANCE_MM],
-], dtype=np.float64)
-
-print(f"\n\n>>> BUILDING INNER A: SOUTH HOLE (base diameter {INNER_BASE_DIAMETER_MM:.3f} mm)")
-_t_inner_south = time.perf_counter()
-inner_south_mesh = build_inner_model(
+# Variant A: two TRUE UNDERCUT keyhole/bayonet locks at EAST and WEST,
+# plus one separate conventional NORTH blind hole. There is NO NORTH or SOUTH bayonet.
+# Both bayonets are oriented so the model locks COUNTER-CLOCKWISE viewed from TOP.
+print(
+    f"\n\n>>> BUILDING INNER A: EAST + WEST UNDERCUT KEYHOLE LOCKS + NORTH Ø7 HOLE "
+    f"(base diameter {INNER_BASE_DIAMETER_MM:.3f} mm)"
+)
+_t_inner_ew = time.perf_counter()
+inner_ew_bayonet_mesh = build_inner_east_west_keyhole_model(
     inner_terrain,
-    south_hole_centers,
     INNER_BASE_DIAMETER_MM,
-    variant_name="INNER SOUTH",
+    variant_name="INNER E+W UNDERCUT KEYHOLES + NORTH HOLE",
 )
-validate_mesh(inner_south_mesh, "INNER SOUTH MODEL VALIDATION")
+validate_mesh(inner_ew_bayonet_mesh, "INNER E+W UNDERCUT KEYHOLES + NORTH HOLE VALIDATION")
 print(
-    "INNER SOUTH hemispherical-ended hole: "
-    f"diameter={INNER_BOTTOM_HOLE_DIAMETER_MM:.3f} mm, "
-    f"center=(0.000, {-INNER_BOTTOM_HOLE_CENTER_DISTANCE_MM:.3f}) mm, "
-    f"straight_depth={INNER_BOTTOM_HOLE_DEPTH_MM:.3f} mm, "
-    f"total_depth={INNER_BOTTOM_HOLE_DEPTH_MM + INNER_BOTTOM_HOLE_DIAMETER_MM / 2.0:.3f} mm"
+    "INNER EAST+WEST undercut keyhole locks + conventional NORTH hole: "
+    f"E/W path radius={EW_BAYONET_CENTER_DISTANCE_MM:.3f} mm, "
+    f"rotation={EW_BAYONET_ROTATION_DEG:.3f} deg, "
+    f"entry/head-channel diameter={EW_BAYONET_HEAD_DIAMETER_MM:.3f} mm, "
+    f"stem-slot width={EW_BAYONET_STEM_SLOT_WIDTH_MM:.3f} mm, "
+    f"lip thickness={EW_BAYONET_LIP_THICKNESS_MM:.3f} mm, "
+    f"extra NORTH hole diameter={NORTH_EXTRA_HOLE_DIAMETER_MM:.3f} mm, "
+    f"extra NORTH hole center distance={NORTH_EXTRA_HOLE_CENTER_DISTANCE_MM:.3f} mm, "
+    "locking direction=COUNTER-CLOCKWISE viewed from TOP"
 )
-print(f"Inner SOUTH build time: {(time.perf_counter()-_t_inner_south)/60:.2f} min")
+print(f"Inner E+W keyhole build time: {(time.perf_counter()-_t_inner_ew)/60:.2f} min")
 
-# Variant B: three identical holes exactly EAST, WEST and SOUTH,
-# each at the same distance from the center.
-# +X = EAST, -X = WEST, -Y = SOUTH.
-east_west_south_hole_centers = np.array([
-    [+INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM, 0.0],  # EAST
-    [-INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM, 0.0],  # WEST
-    [0.0, -INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM],  # SOUTH
-], dtype=np.float64)
+# Variant B: same TRUE UNDERCUT EAST + WEST bayonet type as INNER A,
+# but with the locked bayonet path radius moved to exactly 89 mm from model center.
+# Keep the existing conventional NORTH Ø7 mm hole at 84 mm from model center.
+INNER_B_EW_BAYONET_CENTER_DISTANCE_MM = 89.0
+INNER_B_NORTH_HOLE_DIAMETER_MM = 7.0
+INNER_B_NORTH_HOLE_CENTER_DISTANCE_MM = 84.0
 
-print(f"\n\n>>> BUILDING INNER B: EAST + WEST + SOUTH HOLES (base diameter {INNER_BASE_DIAMETER2_MM:.3f} mm)")
+print(
+    f"\n\n>>> BUILDING INNER B: EAST + WEST UNDERCUT KEYHOLE LOCKS AT "
+    f"{INNER_B_EW_BAYONET_CENTER_DISTANCE_MM:.3f} MM + NORTH "
+    f"Ø{INNER_B_NORTH_HOLE_DIAMETER_MM:.1f} HOLE "
+    f"(base diameter {INNER_BASE_DIAMETER2_MM:.3f} mm)"
+)
 _t_inner_2 = time.perf_counter()
-inner_three_holes_mesh = build_inner_model(
+inner_three_holes_mesh = build_inner_east_west_keyhole_model(
     inner_terrain,
-    east_west_south_hole_centers,
     INNER_BASE_DIAMETER2_MM,
-    variant_name="INNER E+W+S",
+    variant_name="INNER B E+W UNDERCUT KEYHOLES + NORTH HOLE",
+    ew_path_radius_mm=INNER_B_EW_BAYONET_CENTER_DISTANCE_MM,
+    north_hole_center_distance_mm=INNER_B_NORTH_HOLE_CENTER_DISTANCE_MM,
+    north_hole_diameter_mm=INNER_B_NORTH_HOLE_DIAMETER_MM,
 )
-validate_mesh(inner_three_holes_mesh, "INNER E+W+S MODEL VALIDATION")
+validate_mesh(
+    inner_three_holes_mesh,
+    "INNER B E+W UNDERCUT KEYHOLES + NORTH HOLE VALIDATION",
+)
 print(
-    "INNER EAST+WEST+SOUTH hemispherical-ended holes: "
-    f"diameter={INNER_BOTTOM_HOLE_DIAMETER_MM:.3f} mm each, "
-    f"centers=(+{INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM:.3f}, 0.000), "
-    f"(-{INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM:.3f}, 0.000), and "
-    f"(0.000, -{INNER_BOTTOM_HOLE_CENTER_DISTANCE2_MM:.3f}) mm, "
-    f"straight_depth={INNER_BOTTOM_HOLE_DEPTH_MM:.3f} mm, "
-    f"total_depth={INNER_BOTTOM_HOLE_DEPTH_MM + INNER_BOTTOM_HOLE_DIAMETER_MM / 2.0:.3f} mm"
+    "INNER B EAST+WEST undercut keyhole locks + conventional NORTH hole: "
+    f"E/W path radius={INNER_B_EW_BAYONET_CENTER_DISTANCE_MM:.3f} mm, "
+    f"rotation={EW_BAYONET_ROTATION_DEG:.3f} deg, "
+    f"entry/head-channel diameter={EW_BAYONET_HEAD_DIAMETER_MM:.3f} mm, "
+    f"stem-slot width={EW_BAYONET_STEM_SLOT_WIDTH_MM:.3f} mm, "
+    f"lip thickness={EW_BAYONET_LIP_THICKNESS_MM:.3f} mm, "
+    f"NORTH hole diameter={INNER_B_NORTH_HOLE_DIAMETER_MM:.3f} mm at "
+    f"(0.000, +{INNER_B_NORTH_HOLE_CENTER_DISTANCE_MM:.3f}) mm, "
+    "locking direction=COUNTER-CLOCKWISE viewed from TOP"
 )
-print(f"Inner 3-hole build time: {(time.perf_counter()-_t_inner_2)/60:.2f} min")
+print(f"Inner B E+W keyhole build time: {(time.perf_counter()-_t_inner_2)/60:.2f} min")
+
+# Engrave only N into BOTH INNER models.
+inner_ew_bayonet_mesh = engrave_inner_bottom(
+    inner_ew_bayonet_mesh,
+    "INNER A",
+)
+validate_mesh(inner_ew_bayonet_mesh, "INNER A AFTER BOTTOM ENGRAVING")
+
+inner_three_holes_mesh = engrave_inner_bottom(
+    inner_three_holes_mesh,
+    "INNER B",
+)
+validate_mesh(inner_three_holes_mesh, "INNER B AFTER BOTTOM ENGRAVING")
 
 print("\n\n>>> BUILDING OUTER ANNULUS")
 _t_annulus = time.perf_counter()
@@ -1465,42 +2717,126 @@ validate_mesh(annulus2_mesh, "ANNULUS 2 NO-INNER-BOTTOM-BEVEL VALIDATION")
 print(f"Annulus 2 build time: {(time.perf_counter()-_t_annulus2)/60:.2f} min")
 
 # ============================================================
-# EXPORT + DOWNLOAD ALL FOUR STL FILES
+# BUILD THE SINGLE N INSERT AND BOTH PRINT-READY ASSEMBLY STLS
 # ============================================================
 
-inner_south_output = "terrain_inner_south_hole.stl"
-inner_three_holes_output = "terrain_inner_east_west_south_holes.stl"
-annulus_output = "terrain_outer_annulus.stl"
-annulus2_output = "terrain_outer_annulus_no_bottom_inner_bevel.stl"
+def make_n_for_print():
+    """Use the identical font/size/clearance as the previous N insert."""
+    ref = _make_text_cutter(
+        BOTTOM_TEXT_SIZE_REFERENCE, 0.0,
+        target_height_mm=1.0e6,
+        max_width_mm=BOTTOM_TEXT_SIZE_REFERENCE_WIDTH_MM,
+        xy_scale=1.0,
+    )
+    actual_height = float(ref.bounds[1, 1] - ref.bounds[0, 1])
+    cutter = _make_text_cutter(
+        "N", 0.0,
+        target_height_mm=actual_height * BOTTOM_NORTH_MARKER_SCALE,
+        max_width_mm=np.inf,
+        xy_scale=1.0,
+    )
+    letter = _make_bottom_insert_piece_from_cutter(cutter)
+    mid_x = 0.5 * (letter.bounds[0, 0] + letter.bounds[1, 0])
+    mid_y = 0.5 * (letter.bounds[0, 1] + letter.bounds[1, 1])
+    letter.apply_translation([
+        N_PRINT_CENTER_X_MM - mid_x,
+        N_PRINT_CENTER_Y_MM - mid_y,
+        -letter.bounds[0, 2],
+    ])
+    return letter
 
-inner_south_mesh.export(inner_south_output)
-inner_three_holes_mesh.export(inner_three_holes_output)
-annulus_mesh.export(annulus_output)
-annulus2_mesh.export(annulus2_output)
 
-print("\nSaved:", inner_south_output)
-print("Saved:", inner_three_holes_output)
-print("Saved:", annulus_output)
-print("Saved:", annulus2_output)
-print("\nDownloading all four STL files...")
+def load_and_position_target(path, label):
+    # force='mesh' handles a Scene if the imported file contains multiple objects.
+    target = trimesh.load(path, force="mesh", process=False)
+    if not isinstance(target, trimesh.Trimesh) or len(target.faces) == 0:
+        raise ValueError(f"{label}: downloaded STL has no usable triangular mesh")
+    target = target.copy()
+    center_x = 0.5 * float(target.bounds[0, 0] + target.bounds[1, 0])
+    center_y = 0.5 * float(target.bounds[0, 1] + target.bounds[1, 1])
+    dz = -float(target.bounds[0, 2]) if PLACE_TARGET_STL_ON_BED else 0.0
+    target.apply_translation([
+        -center_x if CENTER_TARGET_STL_ON_XY else 0.0,
+        -center_y if CENTER_TARGET_STL_ON_XY else 0.0,
+        dz,
+    ])
+    print(f"{label} target bounds after placement [mm]:\n{target.bounds}")
+    print(f"{label} target watertight: {target.is_watertight}")
+    return target
 
-files.download(inner_south_output)
-files.download(inner_three_holes_output)
-files.download(annulus_output)
-files.download(annulus2_output)
 
-print(f"\nTotal runtime: {(time.perf_counter()-_t_total)/60:.2f} min")
-print(
-    "DONE - one TIFF produced two INNER base models with independent diameters "
-    "plus their corresponding OUTER annulus STL files."
+def prepare_annulus(mesh, rotation_degrees, label, extra_x_offset_mm=0.0):
+    part = mesh.copy()
+    # Rotate around the global Z axis BEFORE centering / grounding.
+    if rotation_degrees:
+        rot = trimesh.transformations.rotation_matrix(
+            np.deg2rad(rotation_degrees), [0, 0, 1], [0, 0, 0]
+        )
+        part.apply_transform(rot)
+    cx = 0.5 * float(part.bounds[0, 0] + part.bounds[1, 0])
+    cy = 0.5 * float(part.bounds[0, 1] + part.bounds[1, 1])
+    part.apply_translation([-cx + float(extra_x_offset_mm), -cy, -float(part.bounds[0, 2])])
+    if not np.isclose(part.bounds[0, 2], 0.0, atol=1e-6):
+        raise RuntimeError(f"{label}: bottom of annulus is not on Z=0")
+    print(f"{label}: rotation +{rotation_degrees:.1f} deg CCW looking from +Z; extra X offset +{extra_x_offset_mm:.3f} mm")
+    print(f"{label} bounds [mm]:\n{part.bounds}")
+    return part
+
+
+def write_compact_stl(target_path, annulus_source, rotation, output_path, label, annulus_extra_x_mm=0.0):
+    target = load_and_position_target(target_path, label)
+    ring = prepare_annulus(annulus_source, rotation, label, annulus_extra_x_mm)
+    letter = make_n_for_print()
+    # Concatenate triangle meshes into ONE STL, keeping three independent shells.
+    # No boolean union: preserving exact dimensions is important for fitted pieces.
+    assembly = trimesh.util.concatenate([target, ring, letter])
+    if not np.all(np.isfinite(assembly.vertices)):
+        raise RuntimeError(f"{label}: non-finite vertices in resulting STL")
+    assembly.export(output_path)
+    print(f"\n{label}: saved {output_path}")
+    print(f"  N center XY: ({N_PRINT_CENTER_X_MM:.3f}, {N_PRINT_CENTER_Y_MM:.3f}) mm")
+    print(f"  N bottom Z: {letter.bounds[0, 2]:.3f} mm")
+    print(f"  Assembly bounds [mm]:\n{assembly.bounds}")
+    print("  NOTE: 3 components in one STL; they are NOT boolean-fused.")
+    return output_path
+
+output1 = write_compact_stl(
+    annulus1_target_stl, annulus_mesh, ANNULUS1_ROTATION_DEG,
+    "FINAL_annulus1_rotated90_with_N.stl", "ANNULUS 1",
+    annulus_extra_x_mm=ANNULUS1_EXTRA_X_OFFSET_MM
 )
+output2 = write_compact_stl(
+    annulus2_target_stl, annulus2_mesh, 0.0,
+    "FINAL_annulus2_wider_with_N.stl", "ANNULUS 2 (WIDER)"
+)
+
+# ============================================================
+# EXPORT ONLY FOUR REQUIRED FINAL STL FILES
+# ============================================================
+# Individual annuli and the standalone N insert are used internally, but are
+# intentionally NOT exported or downloaded as separate STL files.
+inner_a_output = "terrain_inner_east_west_undercut_keyholes_plus_north_7mm_hole.stl"
+inner_b_output = "terrain_inner_B_east_west_undercut_keyholes_89mm_plus_north_7mm_hole.stl"
+
+inner_ew_bayonet_mesh.export(inner_a_output)
+print("Saved:", inner_a_output)
+inner_three_holes_mesh.export(inner_b_output)
+print("Saved:", inner_b_output)
+
+final_outputs = (inner_a_output, inner_b_output, output1, output2)
+print("\nDownloading ONLY four STL files (two INNER and two annulus+N assemblies)...")
+for path in final_outputs:
+    files.download(path)
+print(f"\nTotal runtime: {(time.perf_counter()-_t_total)/60:.2f} min")
+print("DONE: four STL files only: INNER A, INNER B, assembly 1, assembly 2.")
 
 # ============================================================
 # REAL-WORLD DISTANCE FOR 180 MM AT MODEL SCALE
 # ============================================================
 
+# These values are still used by the final information printout even though
+# the scale/VE engraving text itself was removed from the underside artwork.
 MODEL_LENGTH_MM = 180.0
-
 real_distance_km = MODEL_LENGTH_MM * MAP_SCALE / 1_000_000.0
 real_distance_miles = real_distance_km * 0.621371192237334
 
